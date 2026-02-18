@@ -105,6 +105,9 @@ export type SettingsViewProps = {
   repairOpencodeCache: () => void;
   cacheRepairBusy: boolean;
   cacheRepairResult: string | null;
+  cleanupOpenworkDockerContainers: () => void;
+  dockerCleanupBusy: boolean;
+  dockerCleanupResult: string | null;
   notionStatus: "disconnected" | "connecting" | "connected" | "error";
   notionStatusDetail: string | null;
   notionError: string | null;
@@ -311,6 +314,21 @@ export default function SettingsView(props: SettingsViewProps) {
   const [openworkReconnectError, setOpenworkReconnectError] = createSignal<string | null>(null);
   const providerConnectedCount = createMemo(() => (props.providerConnectedIds ?? []).length);
   const providerAvailableCount = createMemo(() => (props.providers ?? []).length);
+  const connectedProviderNames = createMemo(() => {
+    const connectedIds = props.providerConnectedIds ?? [];
+    if (!connectedIds.length) return [] as string[];
+
+    const providersById = new Map((props.providers ?? []).map((provider) => [provider.id, provider]));
+    const names = connectedIds
+      .map((id) => {
+        const provider = providersById.get(id);
+        const label = provider?.name?.trim() || provider?.id?.trim() || id.trim();
+        return label;
+      })
+      .filter((name) => name.length > 0);
+
+    return Array.from(new Set(names));
+  });
   const providerStatusLabel = createMemo(() => {
     if (!providerAvailableCount()) return "Unavailable";
     if (!providerConnectedCount()) return "Not connected";
@@ -672,50 +690,14 @@ export default function SettingsView(props: SettingsViewProps) {
       <Switch>
         <Match when={activeTab() === "general"}>
           <div class="space-y-6">
-            <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-5 space-y-3">
-              <div class="text-sm font-medium text-gray-12">Connection</div>
-              <div class="text-xs text-gray-10">{props.headerStatus}</div>
-              <div class="text-xs text-gray-7 font-mono">{props.baseUrl}</div>
-              <div class="pt-2 flex flex-wrap gap-2">
-                <Button variant="secondary" onClick={props.toggleDeveloperMode}>
-                  <Shield size={16} />
-                  {props.developerMode ? "Disable Developer Mode" : "Enable Developer Mode"}
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={handleReconnectOpenworkServer}
-                  disabled={props.busy || props.openworkReconnectBusy || !props.openworkServerUrl.trim()}
-                >
-                  <RefreshCcw size={14} class={props.openworkReconnectBusy ? "animate-spin" : ""} />
-                  {props.openworkReconnectBusy ? "Reconnecting..." : "Reconnect server"}
-                </Button>
-                <Show when={isLocalEngineRunning()}>
-                  <Button variant="danger" onClick={props.stopHost} disabled={props.busy}>
-                    Stop local server
-                  </Button>
-                </Show>
-                <Show when={!isLocalEngineRunning() && props.openworkServerStatus === "connected"}>
-                  <Button variant="outline" onClick={props.stopHost} disabled={props.busy}>
-                    Disconnect server
-                  </Button>
-                </Show>
-              </div>
-              <Show when={openworkReconnectStatus()}>
-                {(value) => <div class="text-xs text-gray-9">{value()}</div>}
-              </Show>
-              <Show when={openworkReconnectError()}>
-                {(value) => <div class="text-xs text-red-11">{value()}</div>}
-              </Show>
-            </div>
-
-            <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-5 space-y-4">
+            <div class="bg-gray-2/30 border border-gray-7/60 rounded-2xl p-5 space-y-4">
               <div class="flex items-start justify-between gap-4">
                 <div>
                   <div class="flex items-center gap-2">
                     <PlugZap size={16} class="text-gray-11" />
                     <div class="text-sm font-medium text-gray-12">Providers</div>
                   </div>
-                  <div class="text-xs text-gray-10 mt-1">Connect services for models and tools.</div>
+                  <div class="text-xs text-gray-9 mt-1">Connect services for models and tools.</div>
                 </div>
                 <div class={`text-xs px-2 py-1 rounded-full border ${providerStatusStyle()}`}>
                   {providerStatusLabel()}
@@ -730,8 +712,20 @@ export default function SettingsView(props: SettingsViewProps) {
                 >
                   {props.providerAuthBusy ? "Loading providers..." : "Connect provider"}
                 </Button>
-                <div class="text-xs text-gray-9">{providerSummary()}</div>
+                <div class="text-xs text-gray-10">{providerSummary()}</div>
               </div>
+
+              <Show when={connectedProviderNames().length > 0}>
+                <div class="flex flex-wrap items-center gap-2">
+                  <For each={connectedProviderNames()}>
+                    {(name) => (
+                      <span class="rounded-full border border-green-7/30 bg-green-3/40 px-2 py-1 text-[11px] font-medium text-green-12">
+                        {name}
+                      </span>
+                    )}
+                  </For>
+                </div>
+              </Show>
 
               <Show when={providerConnectError()}>
                 <div class="rounded-xl border border-red-7/30 bg-red-1/40 px-3 py-2 text-xs text-red-11">
@@ -739,15 +733,15 @@ export default function SettingsView(props: SettingsViewProps) {
                 </div>
               </Show>
 
-              <div class="text-[11px] text-gray-8">
-                API keys are stored locally by OpenCode. Use <span class="font-mono">/models</span> to pick a default.
+              <div class="text-[11px] text-gray-9">
+                API keys are stored locally by OpenCode. Set your default model in the <span class="font-medium">Model</span> tab.
               </div>
             </div>
 
-            <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-5 space-y-4">
+            <div class="bg-gray-2/30 border border-gray-7/60 rounded-2xl p-5 space-y-4">
               <div>
                 <div class="text-sm font-medium text-gray-12">Appearance</div>
-                <div class="text-xs text-gray-10">Match the system or force light/dark mode.</div>
+                <div class="text-xs text-gray-9">Match the system or force light/dark mode.</div>
               </div>
 
               <div class="flex flex-wrap gap-2">
@@ -777,7 +771,7 @@ export default function SettingsView(props: SettingsViewProps) {
                 </Button>
               </div>
 
-              <div class="text-xs text-gray-7">
+              <div class="text-xs text-gray-8">
                 System mode follows your OS preference automatically.
               </div>
             </div>
@@ -842,6 +836,54 @@ export default function SettingsView(props: SettingsViewProps) {
 
         <Match when={activeTab() === "advanced"}>
           <div class="space-y-6">
+            <div class="bg-gray-2/30 border border-gray-7/60 rounded-2xl p-5 space-y-3">
+              <div class="text-sm font-medium text-gray-12">Developer mode</div>
+              <div class="text-xs text-gray-9">
+                Enables debug tools, diagnostics, and the Developer tab.
+              </div>
+              <div class="pt-1 flex flex-wrap items-center gap-3">
+                <Button variant={props.developerMode ? "secondary" : "outline"} onClick={props.toggleDeveloperMode}>
+                  <Shield size={16} />
+                  {props.developerMode ? "Disable Developer Mode" : "Enable Developer Mode"}
+                </Button>
+                <div class="text-xs text-gray-10">
+                  {props.developerMode ? "Developer panel enabled." : "Enable this to access the Developer panel."}
+                </div>
+              </div>
+            </div>
+
+            <div class="bg-gray-2/30 border border-gray-7/60 rounded-2xl p-5 space-y-3">
+              <div class="text-sm font-medium text-gray-12">Connection</div>
+              <div class="text-xs text-gray-9">{props.headerStatus}</div>
+              <div class="text-xs text-gray-8 font-mono">{props.baseUrl}</div>
+              <div class="pt-2 flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  onClick={handleReconnectOpenworkServer}
+                  disabled={props.busy || props.openworkReconnectBusy || !props.openworkServerUrl.trim()}
+                >
+                  <RefreshCcw size={14} class={props.openworkReconnectBusy ? "animate-spin" : ""} />
+                  {props.openworkReconnectBusy ? "Reconnecting..." : "Reconnect server"}
+                </Button>
+                <Show when={isLocalEngineRunning()}>
+                  <Button variant="danger" onClick={props.stopHost} disabled={props.busy}>
+                    Stop local server
+                  </Button>
+                </Show>
+                <Show when={!isLocalEngineRunning() && props.openworkServerStatus === "connected"}>
+                  <Button variant="outline" onClick={props.stopHost} disabled={props.busy}>
+                    Disconnect server
+                  </Button>
+                </Show>
+              </div>
+              <Show when={openworkReconnectStatus()}>
+                {(value) => <div class="text-xs text-gray-10">{value()}</div>}
+              </Show>
+              <Show when={openworkReconnectError()}>
+                {(value) => <div class="text-xs text-red-11">{value()}</div>}
+              </Show>
+            </div>
+
             <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-5 space-y-3">
               <div class="flex items-start justify-between gap-4">
                 <div>
@@ -860,8 +902,8 @@ export default function SettingsView(props: SettingsViewProps) {
                       <>
                         <div class="flex items-center justify-between bg-gray-1 p-3 rounded-xl border border-gray-6">
                           <div class="space-y-0.5">
-                            <div class="text-sm text-gray-12">Automatic checks</div>
-                            <div class="text-xs text-gray-7">Once per day (quiet)</div>
+                            <div class="text-sm text-gray-12">Background checks</div>
+                            <div class="text-xs text-gray-7">OpenWork always checks on launch. Also checks once per day (quiet).</div>
                           </div>
                           <button
                             class={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
@@ -1033,6 +1075,33 @@ export default function SettingsView(props: SettingsViewProps) {
                     title={isTauriRuntime() ? "" : "Cache repair requires the desktop app"}
                   >
                     {props.cacheRepairBusy ? "Repairing cache" : "Repair cache"}
+                  </Button>
+                </div>
+
+                <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div class="min-w-0">
+                    <div class="text-sm text-gray-12">OpenWork Docker containers</div>
+                    <div class="text-xs text-gray-7">
+                      Force-remove Docker containers launched by OpenWork (sandbox + local dev stacks).
+                    </div>
+                    <Show when={props.dockerCleanupResult}>
+                      <div class="text-xs text-gray-11 mt-2">{props.dockerCleanupResult}</div>
+                    </Show>
+                  </div>
+                  <Button
+                    variant="danger"
+                    class="text-xs h-8 py-0 px-3 shrink-0"
+                    onClick={props.cleanupOpenworkDockerContainers}
+                    disabled={props.dockerCleanupBusy || props.anyActiveRuns || !isTauriRuntime()}
+                    title={
+                      !isTauriRuntime()
+                        ? "Docker cleanup requires the desktop app"
+                        : props.anyActiveRuns
+                          ? "Stop active runs before cleanup"
+                          : ""
+                    }
+                  >
+                    {props.dockerCleanupBusy ? "Removing containers..." : "Delete containers"}
                   </Button>
                 </div>
 

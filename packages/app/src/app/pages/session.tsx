@@ -28,6 +28,7 @@ import {
   ChevronDown,
   ChevronRight,
   Cpu,
+  HeartPulse,
   HardDrive,
   History,
   ListTodo,
@@ -54,9 +55,20 @@ import ProviderAuthModal from "../components/provider-auth-modal";
 import ShareWorkspaceModal from "../components/share-workspace-modal";
 import StatusBar from "../components/status-bar";
 import { buildOpenworkWorkspaceBaseUrl, createOpenworkServerClient } from "../lib/openwork-server";
-import type { OpenworkServerClient, OpenworkServerSettings, OpenworkServerStatus } from "../lib/openwork-server";
+import type {
+  OpenworkServerClient,
+  OpenworkServerSettings,
+  OpenworkServerStatus,
+  OpenworkSoulStatus,
+} from "../lib/openwork-server";
 import { join } from "@tauri-apps/api/path";
-import { formatRelativeTime, isTauriRuntime, normalizeDirectoryPath, parseTemplateFrontmatter } from "../utils";
+import {
+  formatRelativeTime,
+  getWorkspaceTaskLoadErrorDisplay,
+  isTauriRuntime,
+  normalizeDirectoryPath,
+  parseTemplateFrontmatter,
+} from "../utils";
 
 import browserSetupTemplate from "../data/commands/browser-setup.md?raw";
 import soulSetupTemplate from "../data/commands/give-me-a-soul.md?raw";
@@ -86,6 +98,7 @@ export type SessionViewProps = {
   testWorkspaceConnection: (workspaceId: string) => Promise<boolean> | boolean;
   editWorkspaceConnection: (workspaceId: string) => void;
   forgetWorkspace: (workspaceId: string) => void;
+  soulStatusByWorkspaceId: Record<string, OpenworkSoulStatus | null>;
   openCreateWorkspace: () => void;
   openCreateRemoteWorkspace: () => void;
   importWorkspaceConfig: () => void;
@@ -257,7 +270,13 @@ export default function SessionView(props: SessionViewProps) {
     workspace.path?.trim() ||
     "Worker";
   const workspaceKindLabel = (workspace: WorkspaceInfo) =>
-    workspace.workspaceType === "remote" ? "Remote" : "Local";
+    workspace.workspaceType === "remote"
+      ? workspace.sandboxBackend === "docker" ||
+        Boolean(workspace.sandboxRunId?.trim()) ||
+        Boolean(workspace.sandboxContainerName?.trim())
+        ? "Sandbox"
+        : "Remote"
+      : "Local";
   const todoList = createMemo(() => props.todos.filter((todo) => todo.content.trim()));
   const todoCount = createMemo(() => todoList().length);
   const todoCompletedCount = createMemo(() =>
@@ -1505,7 +1524,7 @@ export default function SessionView(props: SessionViewProps) {
           label: "Access token",
           value: token,
           secret: true,
-          placeholder: token ? undefined : "Set token in Advanced",
+          placeholder: token ? undefined : "Set token in workspace settings",
           hint: "This token grants access to the worker on that host.",
         },
       ];
@@ -1613,27 +1632,44 @@ export default function SessionView(props: SessionViewProps) {
 
   const isSandboxWorkspace = createMemo(() => Boolean((props.activeWorkspaceDisplay as any)?.sandboxContainerName?.trim()));
 
-  const uploadInboxFiles = async (files: File[]) => {
+  const uploadInboxFiles = async (
+    files: File[],
+    options?: { notify?: boolean },
+  ): Promise<Array<{ name: string; path: string }>> => {
+    const notify = options?.notify ?? true;
     const client = props.openworkServerClient;
     const workspaceId = props.openworkServerWorkspaceId?.trim() ?? "";
     if (!client || !workspaceId) {
-      setToastMessage("Connect to the OpenWork server to upload inbox files.");
-      return;
+      if (notify) {
+        setToastMessage("Connect to the OpenWork server to upload inbox files.");
+      }
+      return [];
     }
-    if (!files.length) return;
+    if (!files.length) return [];
 
     const label = files.length === 1 ? files[0]?.name ?? "file" : `${files.length} files`;
-    setToastMessage(`Uploading ${label} to inbox...`);
+    if (notify) {
+      setToastMessage(`Uploading ${label} to inbox...`);
+    }
 
     try {
+      const uploaded: Array<{ name: string; path: string }> = [];
       for (const file of files) {
-        await client.uploadInbox(workspaceId, file);
+        const result = await client.uploadInbox(workspaceId, file);
+        const path = result.path?.trim() || file.name;
+        uploaded.push({ name: file.name || path, path });
       }
-      const summary = files.map((file) => file.name).filter(Boolean).join(", ");
-      setToastMessage(summary ? `Uploaded to inbox: ${summary}` : "Uploaded to inbox.");
+      if (notify) {
+        const summary = uploaded.map((file) => file.name).filter(Boolean).join(", ");
+        setToastMessage(summary ? `Uploaded to inbox: ${summary}` : "Uploaded to inbox.");
+      }
+      return uploaded;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Inbox upload failed";
-      setToastMessage(message);
+      if (notify) {
+        const message = error instanceof Error ? error.message : "Inbox upload failed";
+        setToastMessage(message);
+      }
+      return [];
     }
   };
 
@@ -1678,7 +1714,7 @@ export default function SessionView(props: SessionViewProps) {
   };
 
   const openConfig = () => {
-    props.setTab("config");
+    props.setTab(props.developerMode ? "config" : "identities");
     props.setView("dashboard");
   };
 
@@ -1688,13 +1724,32 @@ export default function SessionView(props: SessionViewProps) {
     return state === "available" || state === "downloading" || state === "ready";
   });
 
+  const updateDownloadPercent = createMemo<number | null>(() => {
+    const total = props.updateStatus?.totalBytes;
+    if (total == null || total <= 0) return null;
+    const downloaded = props.updateStatus?.downloadedBytes ?? 0;
+    const clamped = Math.max(0, Math.min(1, downloaded / total));
+    return Math.floor(clamped * 100);
+  });
+
   const updatePillLabel = createMemo(() => {
     const state = props.updateStatus?.state;
     if (state === "ready") {
-      return props.anyActiveRuns ? "Update ready" : "Restart";
+      return props.anyActiveRuns ? "Update ready" : "Install update";
     }
-    if (state === "downloading") return "Downloading";
+    if (state === "downloading") {
+      const percent = updateDownloadPercent();
+      return percent == null ? "Downloading" : `Downloading ${percent}%`;
+    }
     return "Update available";
+  });
+
+  const updatePillTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return "border-transparent bg-green-9 text-white shadow-[0_2px_10px_rgba(22,163,74,0.35)] hover:bg-green-10";
+    }
+    return "border-transparent bg-dls-accent text-white shadow-[0_2px_10px_rgba(var(--dls-accent-rgb),0.35)] hover:bg-[var(--dls-accent-hover)]";
   });
 
   const updatePillTitle = createMemo(() => {
@@ -1723,6 +1778,18 @@ export default function SessionView(props: SessionViewProps) {
     props.setView("dashboard");
   };
 
+  const openSoul = (workspaceId?: string) => {
+    const id = (workspaceId ?? props.activeWorkspaceId).trim();
+    if (!id) return;
+    void (async () => {
+      if (id !== props.activeWorkspaceId) {
+        await Promise.resolve(props.activateWorkspace(id));
+      }
+      props.setTab("soul");
+      props.setView("dashboard");
+    })();
+  };
+
   const openProviderAuth = () => {
     void props.openProviderAuthModal().catch((error) => {
       const message = error instanceof Error ? error.message : "Connect failed";
@@ -1737,7 +1804,7 @@ export default function SessionView(props: SessionViewProps) {
           <Show when={showUpdatePill()}>
             <button
               type="button"
-              class="mb-3 w-full flex h-9 items-center gap-2 rounded-xl border border-dls-border bg-dls-hover px-3 text-xs text-dls-secondary shadow-sm transition-colors hover:bg-dls-active hover:text-dls-text"
+              class={`mb-3 w-full flex h-9 items-center gap-2 rounded-xl border px-3 text-xs font-medium transition-all hover:-translate-y-[1px] ${updatePillTone()}`}
               onClick={handleUpdatePillClick}
               title={updatePillTitle()}
               aria-label={updatePillTitle()}
@@ -1745,33 +1812,28 @@ export default function SessionView(props: SessionViewProps) {
               <Show
                 when={props.updateStatus?.state === "downloading"}
                 fallback={
-                  <span
-                    class={`w-2 h-2 rounded-full ${
-                      props.updateStatus?.state === "ready" ? "bg-green-9" : "bg-amber-9"
-                    }`}
-                  />
+                  <span class="w-2 h-2 rounded-full bg-white/85" />
                 }
               >
-                <Loader2 size={14} class="animate-spin text-dls-secondary" />
+                <Loader2 size={14} class="animate-spin text-white/90" />
               </Show>
-              <span class="text-[11px] font-medium text-dls-text">{updatePillLabel()}</span>
+              <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
               <Show when={props.updateStatus?.version}>
                 {(version) => (
-                  <span class="ml-auto text-[11px] text-dls-secondary font-mono">v{version()}</span>
+                  <span class="ml-auto text-[11px] text-white/80 font-mono">v{version()}</span>
                 )}
               </Show>
             </button>
           </Show>
-          <div class="flex items-center text-[11px] font-bold text-dls-secondary uppercase px-3 mb-3 pt-2 tracking-tight">
-            <span>Tasks</span>
-          </div>
-
           <div class="space-y-3 mb-3">
             <For each={props.workspaceSessionGroups}>
               {(group) => {
                 const workspace = () => group.workspace;
                 const isConnecting = () => props.connectingWorkspaceId === workspace().id;
                 const isMenuOpen = () => workspaceMenuId() === workspace().id;
+                const taskLoadError = () => getWorkspaceTaskLoadErrorDisplay(workspace(), group.error);
+                const soulStatus = () => props.soulStatusByWorkspaceId[workspace().id] ?? null;
+                const soulEnabled = () => Boolean(soulStatus()?.enabled);
 
                 return (
                   <div class="space-y-1">
@@ -1810,8 +1872,14 @@ export default function SessionView(props: SessionViewProps) {
                           </button>
                           <div class="min-w-0 flex-1">
                             <div class="text-sm font-medium truncate">{workspaceLabel(workspace())}</div>
-                            <div class="text-[11px] text-dls-secondary">
-                              {workspaceKindLabel(workspace())}
+                            <div class="text-[11px] text-dls-secondary flex items-center gap-1.5">
+                              <span>{workspaceKindLabel(workspace())}</span>
+                              <Show when={soulEnabled()}>
+                                <span class="inline-flex items-center gap-1 rounded-full border border-rose-7/40 bg-rose-3/40 px-1.5 py-0.5 text-[10px] text-rose-11">
+                                  <HeartPulse size={10} />
+                                  Soul
+                                </span>
+                              </Show>
                             </div>
                           </div>
                           <Show when={group.status === "loading"}>
@@ -1819,10 +1887,14 @@ export default function SessionView(props: SessionViewProps) {
                           </Show>
                           <Show when={group.status === "error"}>
                             <span
-                              class="text-[10px] px-2 py-0.5 rounded-full border border-red-7/50 text-red-11 bg-red-3/30"
-                              title={group.error ?? "Failed to load tasks"}
+                              class={`text-[10px] px-2 py-0.5 rounded-full border ${
+                                taskLoadError().tone === "offline"
+                                  ? "border-amber-7/50 text-amber-11 bg-amber-3/30"
+                                  : "border-red-7/50 text-red-11 bg-red-3/30"
+                              }`}
+                              title={taskLoadError().title}
                             >
-                              Error
+                              {taskLoadError().label}
                             </span>
                           </Show>
                           <Show when={isConnecting()}>
@@ -1881,6 +1953,16 @@ export default function SessionView(props: SessionViewProps) {
                             }}
                           >
                             Share...
+                          </button>
+                          <button
+                            type="button"
+                            class="w-full text-left px-2 py-1.5 text-sm rounded-md hover:bg-dls-hover"
+                            onClick={() => {
+                              openSoul(workspace().id);
+                              setWorkspaceMenuId(null);
+                            }}
+                          >
+                            {soulEnabled() ? "Soul settings" : "Enable soul"}
                           </button>
                           <Show when={workspace().workspaceType === "remote"}>
                             <button
@@ -1968,10 +2050,14 @@ export default function SessionView(props: SessionViewProps) {
                               fallback={
                                 <Show when={group.status === "error"}>
                                   <div
-                                    class="w-full px-3 py-2 text-xs text-red-11 ml-2 text-left rounded-lg bg-red-3/20 border border-red-7/40"
-                                    title={group.error ?? "Failed to load tasks"}
+                                    class={`w-full px-3 py-2 text-xs ml-2 text-left rounded-lg border ${
+                                      taskLoadError().tone === "offline"
+                                        ? "text-amber-11 bg-amber-3/20 border-amber-7/40"
+                                        : "text-red-11 bg-red-3/20 border-red-7/40"
+                                    }`}
+                                    title={taskLoadError().title}
                                   >
-                                    Failed to load tasks
+                                    {taskLoadError().message}
                                   </div>
                                 </Show>
                               }
@@ -2103,7 +2189,7 @@ export default function SessionView(props: SessionViewProps) {
             <Show when={showUpdatePill()}>
               <button
                 type="button"
-                class="md:hidden flex h-8 items-center gap-2 rounded-full border border-dls-border bg-dls-hover px-3 text-xs text-dls-secondary shadow-sm transition-colors hover:bg-dls-active hover:text-dls-text"
+                class={`md:hidden flex h-8 items-center gap-2 rounded-full border px-3 text-xs font-medium transition-colors ${updatePillTone()}`}
                 onClick={handleUpdatePillClick}
                 title={updatePillTitle()}
                 aria-label={updatePillTitle()}
@@ -2111,19 +2197,15 @@ export default function SessionView(props: SessionViewProps) {
                 <Show
                   when={props.updateStatus?.state === "downloading"}
                   fallback={
-                    <span
-                      class={`w-2 h-2 rounded-full ${
-                        props.updateStatus?.state === "ready" ? "bg-green-9" : "bg-amber-9"
-                      }`}
-                    />
+                    <span class="w-2 h-2 rounded-full bg-white/85" />
                   }
                 >
-                  <Loader2 size={14} class="animate-spin text-dls-secondary" />
+                  <Loader2 size={14} class="animate-spin text-white/90" />
                 </Show>
-                <span class="text-[11px] font-medium text-dls-text">{updatePillLabel()}</span>
+                <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
                 <Show when={props.updateStatus?.version}>
                   {(version) => (
-                    <span class="hidden sm:inline text-[11px] text-dls-secondary font-mono">v{version()}</span>
+                    <span class="hidden sm:inline text-[11px] text-white/80 font-mono">v{version()}</span>
                   )}
                 </Show>
               </button>
@@ -2357,6 +2439,7 @@ export default function SessionView(props: SessionViewProps) {
             messages={renderedMessages()}
             developerMode={props.developerMode}
             showThinking={props.showThinking}
+            workspaceRoot={props.activeWorkspaceRoot}
             expandedStepIds={props.expandedStepIds}
             setExpandedStepIds={props.setExpandedStepIds}
             searchMatchMessageIds={searchMatchMessageIds()}
@@ -2556,6 +2639,18 @@ export default function SessionView(props: SessionViewProps) {
           <button
             type="button"
             class={`w-full h-10 flex items-center gap-3 px-3 rounded-lg text-sm font-medium transition-colors ${
+              showRightSidebarSelection() && props.tab === "soul"
+                ? "bg-dls-active text-dls-text"
+                : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
+            }`}
+            onClick={() => openSoul()}
+          >
+            <HeartPulse size={18} />
+            Soul
+          </button>
+          <button
+            type="button"
+            class={`w-full h-10 flex items-center gap-3 px-3 rounded-lg text-sm font-medium transition-colors ${
               showRightSidebarSelection() && props.tab === "skills"
                 ? "bg-dls-active text-dls-text"
                 : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
@@ -2596,20 +2691,22 @@ export default function SessionView(props: SessionViewProps) {
             }}
           >
             <MessageCircle size={18} />
-            Identities
+            Messaging
           </button>
-          <button
-            type="button"
-            class={`w-full h-10 flex items-center gap-3 px-3 rounded-lg text-sm font-medium transition-colors ${
-              showRightSidebarSelection() && props.tab === "config"
-                ? "bg-dls-active text-dls-text"
-                : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
-            }`}
-            onClick={openConfig}
-          >
-            <SlidersHorizontal size={18} />
-            Advanced
-          </button>
+          <Show when={props.developerMode}>
+            <button
+              type="button"
+              class={`w-full h-10 flex items-center gap-3 px-3 rounded-lg text-sm font-medium transition-colors ${
+                showRightSidebarSelection() && props.tab === "config"
+                  ? "bg-dls-active text-dls-text"
+                  : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
+              }`}
+              onClick={openConfig}
+            >
+              <SlidersHorizontal size={18} />
+              Advanced
+            </button>
+          </Show>
           </div>
 
           <InboxPanel

@@ -93,6 +93,7 @@ const SANDBOX_INTERNAL_OPENWORK_PORT = DEFAULT_OPENWORK_PORT;
 const SANDBOX_INTERNAL_OPENCODE_ROUTER_HEALTH_PORT = 3005;
 
 const SANDBOX_OPENCODE_GLOBAL_CONFIG_CONTAINER_PATH = "/persist/.config/opencode";
+const SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH = "/persist/.openwork-host-opencode-data";
 
 type ParsedArgs = {
   positionals: string[];
@@ -529,6 +530,43 @@ async function resolveHostOpencodeGlobalConfigDir(): Promise<string | null> {
         // keep looking
       }
     }
+
+    // Fall back to any non-empty config directory. Some setups keep
+    // provider/auth material in files that are not part of the strict list above.
+    try {
+      const entries = await readdir(candidate);
+      if (entries.length > 0) return candidate;
+    } catch {
+      // keep looking
+    }
+  }
+
+  return null;
+}
+
+async function resolveHostOpencodeGlobalDataDir(): Promise<string | null> {
+  const enabled = (process.env.OPENWORK_SANDBOX_MOUNT_OPENCODE_CONFIG ?? "1").trim() !== "0";
+  if (!enabled) return null;
+
+  const candidates: string[] = [];
+  const xdgData = process.env.XDG_DATA_HOME?.trim();
+  if (xdgData) candidates.push(join(xdgData, "opencode"));
+  candidates.push(join(homedir(), ".local", "share", "opencode"));
+  if (process.platform === "darwin") {
+    candidates.push(join(homedir(), "Library", "Application Support", "opencode"));
+  }
+
+  const files = ["auth.json", "mcp-auth.json"];
+  for (const candidate of Array.from(new Set(candidates.map((item) => resolve(expandTildePath(item)))))) {
+    if (!(await isDir(candidate))) continue;
+    for (const file of files) {
+      try {
+        await access(join(candidate, file));
+        return candidate;
+      } catch {
+        // keep looking
+      }
+    }
   }
 
   return null;
@@ -783,10 +821,14 @@ async function ensureWorkspace(workspace: string): Promise<string> {
   const resolved = resolve(workspace);
   await mkdir(resolved, { recursive: true });
 
-  const configPath = join(resolved, "opencode.json");
-  if (!(await fileExists(configPath))) {
+  const configPathJsonc = join(resolved, "opencode.jsonc");
+  const configPathJson = join(resolved, "opencode.json");
+  const hasJsonc = await fileExists(configPathJsonc);
+  const hasJson = await fileExists(configPathJson);
+
+  if (!hasJsonc && !hasJson) {
     const payload = JSON.stringify({ "$schema": "https://opencode.ai/config.json" }, null, 2);
-    await writeFile(configPath, `${payload}\n`, "utf8");
+    await writeFile(configPathJsonc, `${payload}\n`, "utf8");
   }
 
   return resolved;
@@ -1918,13 +1960,44 @@ function opencodeRouterSendToolSource(): string {
   return [
     'import { tool } from "@opencode-ai/plugin"',
     "",
+    "const redactTarget = (value) => {",
+    "  const text = String(value || '').trim()",
+    "  if (!text) return ''",
+    "  if (text.length <= 6) return 'hidden'",
+    "  return `${text.slice(0, 2)}…${text.slice(-2)}`",
+    "}",
+    "",
+    "const buildGuidance = (result) => {",
+    "  const sent = Number(result?.sent || 0)",
+    "  const attempted = Number(result?.attempted || 0)",
+    "  const reason = String(result?.reason || '')",
+    "  const failures = Array.isArray(result?.failures) ? result.failures : []",
+    "",
+    "  if (sent > 0 && failures.length === 0) return 'Delivered successfully.'",
+    "  if (sent > 0) return 'Delivered to at least one conversation, but some targets failed.'",
+    "",
+    "  const chatNotFound = failures.some((item) => /chat not found/i.test(String(item?.error || '')))",
+    "  if (chatNotFound) {",
+    "    return 'Delivery failed because the recipient has not started a chat with the bot yet. Ask them to send /start, then retry.'",
+    "  }",
+    "",
+    "  if (/No bound conversations/i.test(reason)) {",
+    "    return 'No linked conversation found for this workspace yet. Ask the recipient to message the bot first, then retry.'",
+    "  }",
+    "",
+    "  if (attempted === 0) return 'No eligible delivery target found.'",
+    "  return 'Delivery failed. Retry after confirming the recipient and bot linkage.'",
+    "}",
+    "",
     "export default tool({",
-    '  description: "Send a message via opencodeRouter to peers bound to a directory (Telegram/Slack).",',
+    '  description: "Send a message via opencodeRouter (Telegram/Slack) to a peer or directory bindings.",',
     "  args: {",
     '    text: tool.schema.string().describe("Message text to send"),',
     '    channel: tool.schema.enum(["telegram", "slack"]).optional().describe("Channel to send on (default: telegram)"),',
     '    identityId: tool.schema.string().optional().describe("OpenCodeRouter identity id (default: all identities)"),',
-    '    directory: tool.schema.string().optional().describe("Directory to target (default: current session directory)"),',
+    '    directory: tool.schema.string().optional().describe("Directory to target for fan-out (default: current session directory)"),',
+    '    peerId: tool.schema.string().optional().describe("Direct destination peer id (chat/thread id)"),',
+    '    autoBind: tool.schema.boolean().optional().describe("When direct sending, bind peerId to directory if provided"),',
     "  },",
     "  async execute(args, context) {",
     '    const rawPort = (process.env.OPENCODE_ROUTER_HEALTH_PORT || "3005").trim()',
@@ -1936,13 +2009,18 @@ function opencodeRouterSendToolSource(): string {
     '    if (channel !== "telegram" && channel !== "slack") {',
     '      throw new Error("channel must be telegram or slack")',
     "    }",
+    '    const text = String(args.text || "")',
+    '    if (!text.trim()) throw new Error("text is required")',
     '    const directory = (args.directory || context.directory || "").trim()',
-    '    if (!directory) throw new Error("No directory resolved")',
+    '    const peerId = String(args.peerId || "").trim()',
+    '    if (!directory && !peerId) throw new Error("Either directory or peerId is required")',
     "    const payload = {",
     "      channel,",
-    "      directory,",
-    "      text: args.text,",
+    "      text,",
     "      ...(args.identityId ? { identityId: String(args.identityId) } : {}),",
+    "      ...(directory ? { directory } : {}),",
+    "      ...(peerId ? { peerId } : {}),",
+    "      ...(args.autoBind === true ? { autoBind: true } : {}),",
     "    }",
     "    const response = await fetch(`http://127.0.0.1:${port}/send`, {",
     "      method: \"POST\",",
@@ -1950,10 +2028,181 @@ function opencodeRouterSendToolSource(): string {
     "      body: JSON.stringify(payload),",
     "    })",
     "    const body = await response.text()",
+    "    let json = null",
+    "    try {",
+    "      json = JSON.parse(body)",
+    "    } catch {",
+    "      json = null",
+    "    }",
     "    if (!response.ok) {",
     '      throw new Error(`opencodeRouter /send failed (${response.status}): ${body}`)',
     "    }",
-    "    return body",
+    "",
+    "    const sent = Number(json?.sent || 0)",
+    "    const attempted = Number(json?.attempted || 0)",
+    "    const reason = typeof json?.reason === 'string' ? json.reason : ''",
+    "    const failuresRaw = Array.isArray(json?.failures) ? json.failures : []",
+    "    const failures = failuresRaw.map((item) => ({",
+    "      identityId: String(item?.identityId || ''),",
+    "      error: String(item?.error || 'delivery failed'),",
+    "      ...(item?.peerId ? { target: redactTarget(item.peerId) } : {}),",
+    "    }))",
+    "",
+    "    const result = {",
+    "      ok: true,",
+    "      channel,",
+    "      sent,",
+    "      attempted,",
+    "      guidance: buildGuidance({ sent, attempted, reason, failures }),",
+    "      ...(reason ? { reason } : {}),",
+    "      ...(failures.length ? { failures } : {}),",
+    "    }",
+    "    return JSON.stringify(result, null, 2)",
+    "  },",
+    "})",
+    "",
+  ].join("\n");
+}
+
+function opencodeRouterStatusToolSource(): string {
+  return [
+    'import { tool } from "@opencode-ai/plugin"',
+    "",
+    "const redactTarget = (value) => {",
+    "  const text = String(value || '').trim()",
+    "  if (!text) return ''",
+    "  if (text.length <= 6) return 'hidden'",
+    "  return `${text.slice(0, 2)}…${text.slice(-2)}`",
+    "}",
+    "",
+    "export default tool({",
+    '  description: "Check opencodeRouter messaging readiness (health, identities, bindings).",',
+    "  args: {",
+    '    channel: tool.schema.enum(["telegram", "slack"]).optional().describe("Channel to inspect (default: telegram)"),',
+    '    identityId: tool.schema.string().optional().describe("Identity id to scope checks"),',
+    '    directory: tool.schema.string().optional().describe("Directory to inspect bindings for (default: current session directory)"),',
+    '    peerId: tool.schema.string().optional().describe("Peer id to inspect bindings for"),',
+    '    includeBindings: tool.schema.boolean().optional().describe("Include binding details (default: false)"),',
+    "  },",
+    "  async execute(args, context) {",
+    '    const rawPort = (process.env.OPENCODE_ROUTER_HEALTH_PORT || "3005").trim()',
+    "    const port = Number(rawPort)",
+    "    if (!Number.isFinite(port) || port <= 0) {",
+    '      throw new Error(`Invalid OPENCODE_ROUTER_HEALTH_PORT: ${rawPort}`)',
+    "    }",
+    '    const channel = (args.channel || "telegram").trim()',
+    '    if (channel !== "telegram" && channel !== "slack") {',
+    '      throw new Error("channel must be telegram or slack")',
+    "    }",
+    '    const identityId = String(args.identityId || "").trim()',
+    '    const directory = (args.directory || context.directory || "").trim()',
+    '    const peerId = String(args.peerId || "").trim()',
+    '    const includeBindings = args.includeBindings === true',
+    "",
+    "    const fetchJson = async (path) => {",
+    "      const response = await fetch(`http://127.0.0.1:${port}${path}`)",
+    "      const body = await response.text()",
+    "      let json = null",
+    "      try {",
+    "        json = JSON.parse(body)",
+    "      } catch {",
+    "        json = null",
+    "      }",
+    "      if (!response.ok) {",
+    "        return { ok: false, status: response.status, json, error: typeof json?.error === \"string\" ? json.error : body }",
+    "      }",
+    "      return { ok: true, status: response.status, json }",
+    "    }",
+    "",
+    "    const health = await fetchJson('/health')",
+    "    const identities = await fetchJson(`/identities/${channel}`)",
+    "    let bindings = null",
+    "    if (includeBindings) {",
+    "      const search = new URLSearchParams()",
+    "      search.set('channel', channel)",
+    "      if (identityId) search.set('identityId', identityId)",
+    "      bindings = await fetchJson(`/bindings?${search.toString()}`)",
+    "    }",
+    "",
+    "    const identityItems = Array.isArray(identities?.json?.items) ? identities.json.items : []",
+    "    const scopedIdentityItems = identityId",
+    "      ? identityItems.filter((item) => String(item?.id || '').trim() === identityId)",
+    "      : identityItems",
+    "    const runningItems = scopedIdentityItems.filter((item) => item && item.enabled === true && item.running === true)",
+    "    const enabledItems = scopedIdentityItems.filter((item) => item && item.enabled === true)",
+    "",
+    "    const bindingItems = Array.isArray(bindings?.json?.items) ? bindings.json.items : []",
+    "    const filteredBindings = bindingItems.filter((item) => {",
+    "      if (!item || typeof item !== 'object') return false",
+    "      if (directory && String(item.directory || '').trim() !== directory) return false",
+    "      if (peerId && String(item.peerId || '').trim() !== peerId) return false",
+    "      return true",
+    "    })",
+    "    const publicBindings = filteredBindings.map((item) => ({",
+    "      channel: String(item.channel || channel),",
+    "      identityId: String(item.identityId || ''),",
+    "      directory: String(item.directory || ''),",
+    "      ...(item?.peerId ? { target: redactTarget(item.peerId) } : {}),",
+    "      updatedAt: item?.updatedAt,",
+    "    }))",
+    "",
+    "    let ready = false",
+    "    let guidance = ''",
+    "    if (!health.ok) {",
+    "      guidance = 'OpenCode Router health endpoint is unavailable'",
+    "    } else if (!identities.ok) {",
+    "      guidance = `Identity lookup failed for ${channel}`",
+    "    } else if (runningItems.length === 0) {",
+    "      guidance = `No running ${channel} identity`",
+    "    } else if (peerId) {",
+    "      ready = true",
+    "      guidance = 'Ready for direct send'",
+    "    } else if (directory) {",
+    "      ready = filteredBindings.length > 0",
+    "      guidance = ready",
+    "        ? 'Ready for directory fan-out send'",
+    "        : 'No linked conversations found for this directory yet'",
+    "    } else {",
+    "      ready = true",
+    "      guidance = 'Ready. Provide a message target (peer or directory).'",
+    "    }",
+    "",
+    "    const result = {",
+    "      ok: health.ok && identities.ok && (!bindings || bindings.ok),",
+    "      ready,",
+    "      guidance,",
+    "      channel,",
+    "      ...(identityId ? { identityId } : {}),",
+    "      ...(directory ? { directory } : {}),",
+    "      ...(peerId ? { targetProvided: true } : {}),",
+    "      health: {",
+    "        ok: health.ok,",
+    "        status: health.status,",
+    "        error: health.ok ? undefined : health.error,",
+    "        snapshot: health.ok ? health.json : undefined,",
+    "      },",
+    "      identities: {",
+    "        ok: identities.ok,",
+    "        status: identities.status,",
+    "        error: identities.ok ? undefined : identities.error,",
+    "        configured: scopedIdentityItems.length,",
+    "        enabled: enabledItems.length,",
+    "        running: runningItems.length,",
+    "        items: scopedIdentityItems,",
+    "      },",
+    "      ...(includeBindings",
+    "        ? {",
+    "            bindings: {",
+    "              ok: Boolean(bindings?.ok),",
+    "              status: bindings?.status,",
+    "              error: bindings?.ok ? undefined : bindings?.error,",
+    "              count: filteredBindings.length,",
+    "              items: publicBindings,",
+    "            },",
+    "          }",
+    "        : {}),",
+    "    }",
+    "    return JSON.stringify(result, null, 2)",
     "  },",
     "})",
     "",
@@ -1963,15 +2212,20 @@ function opencodeRouterSendToolSource(): string {
 async function ensureOpencodeManagedTools(configDir: string): Promise<void> {
   const toolsDir = join(configDir, "tools");
   await mkdir(toolsDir, { recursive: true });
-  const toolPath = join(toolsDir, "opencode_router_send.ts");
-  const content = `${opencodeRouterSendToolSource()}\n`;
-  try {
-    const existing = await readFile(toolPath, "utf8");
-    if (existing === content) return;
-  } catch {
-    // ignore
-  }
-  await writeFile(toolPath, content, "utf8");
+  const writeManagedTool = async (name: string, source: string) => {
+    const toolPath = join(toolsDir, name);
+    const content = `${source}\n`;
+    try {
+      const existing = await readFile(toolPath, "utf8");
+      if (existing === content) return;
+    } catch {
+      // ignore
+    }
+    await writeFile(toolPath, content, "utf8");
+  };
+
+  await writeManagedTool("opencode_router_send.ts", opencodeRouterSendToolSource());
+  await writeManagedTool("opencode_router_status.ts", opencodeRouterStatusToolSource());
 }
 
 function findWorkspace(state: RouterState, input: string): RouterWorkspace | undefined {
@@ -2611,6 +2865,8 @@ async function writeSandboxEntrypoint(options: {
   const opencodeRouterBin = `${options.rootInContainer}/sidecars/opencode-router`;
   const workspaceDir = "/workspace";
   const opencodeConfigDir = options.opencodeConfigDirInContainer;
+  const hostOpencodeConfigDir = SANDBOX_OPENCODE_GLOBAL_CONFIG_CONTAINER_PATH;
+  const hostOpencodeDataDir = SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH;
 
   const opencodeCors = options.opencode.corsOrigins
     .map((origin) => `--cors ${shQuote(origin)}`)
@@ -2643,13 +2899,18 @@ async function writeSandboxEntrypoint(options: {
     `export HOME=${shQuote("/persist")}`,
     "export XDG_CONFIG_HOME=\"$HOME/.config\"",
     "export XDG_CACHE_HOME=\"$HOME/.cache\"",
-    "mkdir -p \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\"",
+    "export XDG_DATA_HOME=\"$HOME/.local/share\"",
+    "export XDG_STATE_HOME=\"$HOME/.local/state\"",
+    "mkdir -p \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"",
     // Do not `cd` into the mounted workspace: bun-compiled sidecars read bunfig.toml
     // from cwd, and user workspaces may include preloads that break startup.
     `cd ${shQuote("/persist")}`,
     `export OPENCODE_DIRECTORY=${shQuote(workspaceDir)}`,
     `export OPENCODE_CONFIG_DIR=${shQuote(opencodeConfigDir)}`,
     `mkdir -p ${shQuote(opencodeConfigDir)}`,
+    `if [ -d ${shQuote(hostOpencodeConfigDir)} ]; then cp -R ${shQuote(`${hostOpencodeConfigDir}/.`)} ${shQuote(opencodeConfigDir)} 2>/dev/null || true; fi`,
+    "mkdir -p \"$XDG_DATA_HOME/opencode\"",
+    `if [ -d ${shQuote(hostOpencodeDataDir)} ]; then cp ${shQuote(`${hostOpencodeDataDir}/auth.json`)} \"$XDG_DATA_HOME/opencode/auth.json\" 2>/dev/null || true; cp ${shQuote(`${hostOpencodeDataDir}/mcp-auth.json`)} \"$XDG_DATA_HOME/opencode/mcp-auth.json\" 2>/dev/null || true; fi`,
     `export OPENCODE_URL=${shQuote(`http://127.0.0.1:${SANDBOX_INTERNAL_OPENCODE_PORT}`)}`,
     `export OPENCODE_CLIENT=openwork-orchestrator`,
     `export OPENCODE_HOT_RELOAD=${shQuote(options.opencode.hotReload.enabled ? "1" : "0")}`,
@@ -2779,6 +3040,18 @@ async function startDockerSandbox(options: {
     });
   }
 
+  const hostOpencodeData = await resolveHostOpencodeGlobalDataDir();
+  const hasOpencodeDataMount = options.extraMounts.some(
+    (mount) => mount.containerPath === SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH,
+  );
+  if (hostOpencodeData && !hasOpencodeDataMount) {
+    args.push("-v", `${hostOpencodeData}:${SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH}:ro`);
+    options.logger.debug("sandbox: mounted host opencode data", {
+      hostPath: hostOpencodeData,
+      containerPath: SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH,
+    });
+  }
+
   if (options.sidecars.opencodeRouter && options.ports.opencodeRouterHealth) {
     args.push("-p", `${options.ports.opencodeRouterHealth}:${SANDBOX_INTERNAL_OPENCODE_ROUTER_HEALTH_PORT}`);
   }
@@ -2891,6 +3164,21 @@ async function startAppleContainerSandbox(options: {
     options.logger.debug("sandbox: mounted host opencode config", {
       hostPath: hostOpencodeConfig,
       containerPath: SANDBOX_OPENCODE_GLOBAL_CONFIG_CONTAINER_PATH,
+    });
+  }
+
+  const hostOpencodeData = await resolveHostOpencodeGlobalDataDir();
+  const hasOpencodeDataMount = options.extraMounts.some(
+    (mount) => mount.containerPath === SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH,
+  );
+  if (hostOpencodeData && !hasOpencodeDataMount) {
+    args.push(
+      "--mount",
+      `type=bind,source=${hostOpencodeData},target=${SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH},readonly`,
+    );
+    options.logger.debug("sandbox: mounted host opencode data", {
+      hostPath: hostOpencodeData,
+      containerPath: SANDBOX_OPENCODE_GLOBAL_DATA_IMPORT_CONTAINER_PATH,
     });
   }
 

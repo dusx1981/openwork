@@ -39,6 +39,14 @@ import ProtoWorkspacesView from "./pages/proto-workspaces";
 import ProtoV1UxView from "./pages/proto-v1-ux";
 import { createClient, unwrap, waitForHealthy, type OpencodeAuth } from "./lib/opencode";
 import {
+  abortSession as abortSessionTyped,
+  abortSessionSafe,
+  revertSession,
+  unrevertSession,
+  shellInSession,
+  listCommands as listCommandsTyped,
+} from "./lib/opencode-session";
+import {
   DEFAULT_MODEL,
   HIDE_TITLEBAR_PREF_KEY,
   MCP_QUICK_CONNECT,
@@ -139,6 +147,8 @@ import {
   writeOpenworkServerSettings,
   clearOpenworkServerSettings,
   type OpenworkAuditEntry,
+  type OpenworkSoulHeartbeatEntry,
+  type OpenworkSoulStatus,
   type OpenworkServerCapabilities,
   type OpenworkServerDiagnostics,
   type OpenworkServerStatus,
@@ -855,23 +865,7 @@ export default function App() {
       const parts = buildPromptParts(resolvedDraft);
 
       if (resolvedDraft.mode === "shell") {
-        const sessionApi = c.session as any;
-        if (sessionApi.shellAsync) {
-          const result = await sessionApi.shellAsync({ sessionID, command: content });
-          assertNoClientError(result);
-        } else if (sessionApi.shell) {
-          const result = await sessionApi.shell({ sessionID, command: content });
-          assertNoClientError(result);
-        } else {
-          const result = await c.session.promptAsync({
-            sessionID,
-            model,
-            agent: agent ?? undefined,
-            variant: modelVariant() ?? undefined,
-            parts: [{ type: "text", text: `!${content}` }],
-          });
-          assertNoClientError(result);
-        }
+        await shellInSession(c, sessionID, content);
       } else if (resolvedDraft.command) {
         // Slash command: route through session.command() API
         const selected = selectedSessionModel();
@@ -931,7 +925,7 @@ export default function App() {
     // OpenCode exposes session.abort which interrupts the active prompt/run.
     // We intentionally don't mutate global busy state here; the SessionView
     // provides local UX (button disabled + toast) for cancellation.
-    unwrap(await (c.session as any).abort({ sessionID: id }));
+    await abortSessionTyped(c, id);
   }
 
   function retryLastPrompt() {
@@ -996,7 +990,7 @@ export default function App() {
     // Revert is rejected while the session is busy. We *usually* have an accurate
     // session status via SSE, but to be resilient to transient desync we attempt
     // an abort even when we think we're idle.
-    await (c.session as any).abort({ sessionID }).catch(() => undefined);
+    await abortSessionSafe(c, sessionID);
 
     const revertMessageID = selectedSession()?.revert?.messageID ?? null;
     const users = messages().filter((message) => {
@@ -1019,8 +1013,8 @@ export default function App() {
     const messageID = messageIdFromInfo(target);
     if (!messageID) return;
 
-    const next = unwrap(await (c.session as any).revert({ sessionID, messageID }));
-    upsertLocalSession(next as Session);
+    const next = await revertSession(c, sessionID, messageID);
+    upsertLocalSession(next);
     restorePromptFromUserMessage(target);
   }
 
@@ -1029,7 +1023,7 @@ export default function App() {
     const sessionID = (selectedSessionId() ?? "").trim();
     if (!c || !sessionID) return;
 
-    await (c.session as any).abort({ sessionID }).catch(() => undefined);
+    await abortSessionSafe(c, sessionID);
 
     const revertMessageID = selectedSession()?.revert?.messageID ?? null;
     if (!revertMessageID) return;
@@ -1045,8 +1039,8 @@ export default function App() {
     });
 
     if (!next) {
-      const session = unwrap(await (c.session as any).unrevert({ sessionID }));
-      upsertLocalSession(session as Session);
+      const session = await unrevertSession(c, sessionID);
+      upsertLocalSession(session);
       setPrompt("");
       return;
     }
@@ -1054,8 +1048,8 @@ export default function App() {
     const messageID = messageIdFromInfo(next);
     if (!messageID) return;
 
-    const nextSession = unwrap(await (c.session as any).revert({ sessionID, messageID }));
-    upsertLocalSession(nextSession as Session);
+    const nextSession = await revertSession(c, sessionID, messageID);
+    upsertLocalSession(nextSession);
 
     let prior: MessageWithParts | null = null;
     for (let idx = users.length - 1; idx >= 0; idx -= 1) {
@@ -1150,21 +1144,7 @@ export default function App() {
   async function listCommands(): Promise<{ id: string; name: string; description?: string; source?: "command" | "mcp" | "skill" }[]> {
     const c = client();
     if (!c) return [];
-    try {
-      const commandApi = c.command as any;
-      if (!commandApi?.list) return [];
-      const result = await commandApi.list({ directory: workspaceStore.activeWorkspaceRoot().trim() || undefined });
-      const list = result?.data ?? result ?? [];
-      if (!Array.isArray(list)) return [];
-      return list.map((cmd: any) => ({
-        id: `cmd:${cmd.name}`,
-        name: cmd.name,
-        description: cmd.description,
-        source: cmd.source,
-      }));
-    } catch {
-      return [];
-    }
+    return listCommandsTyped(c, workspaceStore.activeWorkspaceRoot().trim() || undefined);
   }
 
   function setSessionAgent(sessionID: string, agent: string | null) {
@@ -1374,6 +1354,13 @@ export default function App() {
   const [scheduledJobsStatus, setScheduledJobsStatus] = createSignal<string | null>(null);
   const [scheduledJobsBusy, setScheduledJobsBusy] = createSignal(false);
   const [scheduledJobsUpdatedAt, setScheduledJobsUpdatedAt] = createSignal<number | null>(null);
+  const [soulStatusByWorkspaceId, setSoulStatusByWorkspaceId] = createSignal<
+    Record<string, OpenworkSoulStatus | null>
+  >({});
+  const [activeSoulHeartbeats, setActiveSoulHeartbeats] = createSignal<OpenworkSoulHeartbeatEntry[]>([]);
+  const [soulStatusBusy, setSoulStatusBusy] = createSignal(false);
+  const [soulHeartbeatsBusy, setSoulHeartbeatsBusy] = createSignal(false);
+  const [soulError, setSoulError] = createSignal<string | null>(null);
 
   // MCP OAuth modal state
   const [mcpAuthModalOpen, setMcpAuthModalOpen] = createSignal(false);
@@ -2384,6 +2371,9 @@ export default function App() {
     cacheRepairBusy,
     cacheRepairResult,
     repairOpencodeCache,
+    dockerCleanupBusy,
+    dockerCleanupResult,
+    cleanupOpenworkDockerContainers,
     updateAutoCheck,
     setUpdateAutoCheck,
     updateAutoDownload,
@@ -2590,6 +2580,163 @@ export default function App() {
     return;
   };
 
+  const resolveSoulWorkspaceMap = async () => {
+    const client = openworkServerClient();
+    if (!client || openworkServerStatus() !== "connected") {
+      return {} as Record<string, string>;
+    }
+
+    const response = await client.listWorkspaces();
+    const items = Array.isArray(response.items) ? response.items : [];
+    const map: Record<string, string> = {};
+
+    const idByLocalPath = new Map<string, string>();
+    for (const item of items) {
+      const path = normalizeDirectoryPath(item.path ?? "");
+      if (!path) continue;
+      idByLocalPath.set(path, item.id);
+    }
+
+    for (const workspace of workspaceStore.workspaces()) {
+      if (workspace.workspaceType === "local") {
+        const key = normalizeDirectoryPath(workspace.path ?? "");
+        if (!key) continue;
+        const found = idByLocalPath.get(key);
+        if (found) {
+          map[workspace.id] = found;
+        }
+        continue;
+      }
+
+      if (workspace.remoteType !== "openwork") {
+        continue;
+      }
+
+      const explicitId =
+        workspace.openworkWorkspaceId?.trim() ||
+        parseOpenworkWorkspaceIdFromUrl(workspace.openworkHostUrl ?? "") ||
+        parseOpenworkWorkspaceIdFromUrl(workspace.baseUrl ?? "");
+      if (explicitId) {
+        map[workspace.id] = explicitId;
+        continue;
+      }
+
+      const directoryHint = normalizeDirectoryPath(workspace.directory ?? workspace.path ?? "");
+      if (!directoryHint) continue;
+      const match = items.find((entry) => {
+        const entryPath = normalizeDirectoryPath(
+          (entry.opencode?.directory ?? entry.directory ?? entry.path ?? "") as string,
+        );
+        return Boolean(entryPath && entryPath === directoryHint);
+      });
+      if (match?.id) {
+        map[workspace.id] = match.id;
+      }
+    }
+
+    return map;
+  };
+
+  const refreshSoulData = async (options?: { force?: boolean }) => {
+    if (soulStatusBusy() && !options?.force) return;
+
+    const client = openworkServerClient();
+    if (!client || openworkServerStatus() !== "connected") {
+      setSoulStatusByWorkspaceId({});
+      setActiveSoulHeartbeats([]);
+      setSoulHeartbeatsBusy(false);
+      setSoulError(null);
+      return;
+    }
+
+    setSoulStatusBusy(true);
+    setSoulError(null);
+    try {
+      const workspaceMap = await resolveSoulWorkspaceMap();
+      const workspaceIds = Object.entries(workspaceMap);
+
+      const nextStatusByWorkspace: Record<string, OpenworkSoulStatus | null> = {};
+      for (const workspace of workspaceStore.workspaces()) {
+        nextStatusByWorkspace[workspace.id] = null;
+      }
+
+      let hadStatusError = false;
+      await Promise.all(
+        workspaceIds.map(async ([workspaceId, openworkId]) => {
+          try {
+            const status = await client.getSoulStatus(openworkId);
+            nextStatusByWorkspace[workspaceId] = status;
+          } catch {
+            hadStatusError = true;
+            nextStatusByWorkspace[workspaceId] = null;
+          }
+        }),
+      );
+      setSoulStatusByWorkspaceId(nextStatusByWorkspace);
+
+      const activeWorkspaceId = workspaceStore.activeWorkspaceId();
+      const activeOpenworkId = workspaceMap[activeWorkspaceId];
+      if (!activeOpenworkId) {
+        setActiveSoulHeartbeats([]);
+        setSoulHeartbeatsBusy(false);
+        if (hadStatusError) {
+          setSoulError("Soul status is partially unavailable.");
+        }
+        return;
+      }
+
+      setSoulHeartbeatsBusy(true);
+      try {
+        const response = await client.listSoulHeartbeats(activeOpenworkId, 30);
+        setActiveSoulHeartbeats(Array.isArray(response.items) ? response.items : []);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to load soul heartbeats.";
+        setActiveSoulHeartbeats([]);
+        setSoulError(message);
+      } finally {
+        setSoulHeartbeatsBusy(false);
+      }
+
+      if (hadStatusError && !soulError()) {
+        setSoulError("Soul status is partially unavailable.");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to load soul status.";
+      setSoulStatusByWorkspaceId({});
+      setActiveSoulHeartbeats([]);
+      setSoulHeartbeatsBusy(false);
+      setSoulError(message);
+    } finally {
+      setSoulStatusBusy(false);
+    }
+  };
+
+  const activeSoulStatus = createMemo(() => {
+    const id = workspaceStore.activeWorkspaceId();
+    if (!id) return null;
+    return soulStatusByWorkspaceId()[id] ?? null;
+  });
+
+  let lastSoulRefreshKey = "";
+  createEffect(() => {
+    const status = openworkServerStatus();
+    const hasClient = Boolean(openworkServerClient());
+    const activeWorkspaceId = workspaceStore.activeWorkspaceId();
+    const workspacesKey = workspaceStore
+      .workspaces()
+      .map((workspace) => {
+        const root = workspace.workspaceType === "local"
+          ? workspace.path?.trim() ?? ""
+          : workspace.directory?.trim() ?? workspace.path?.trim() ?? "";
+        return [workspace.id, workspace.workspaceType, workspace.remoteType ?? "", root, workspace.openworkWorkspaceId ?? ""].join("|");
+      })
+      .join(";");
+    const key = [status, hasClient ? "1" : "0", activeWorkspaceId, workspacesKey].join("::");
+    if (key === lastSoulRefreshKey) return;
+    lastSoulRefreshKey = key;
+    void refreshSoulData().catch(() => undefined);
+  });
+
   createEffect(() => {
     if (!isTauriRuntime()) return;
     workspaceStore.activeWorkspaceId();
@@ -2616,6 +2763,7 @@ export default function App() {
   const [autoConnectAttempted, setAutoConnectAttempted] = createSignal(false);
 
   const [appVersion, setAppVersion] = createSignal<string | null>(null);
+  const [launchUpdateCheckTriggered, setLaunchUpdateCheckTriggered] = createSignal(false);
 
 
   const busySeconds = createMemo(() => {
@@ -3557,6 +3705,13 @@ export default function App() {
     }
   }
 
+  function runSoulPrompt(promptText: string) {
+    const text = promptText.trim();
+    if (!text) return;
+    setPrompt(text);
+    void createSessionAndOpen();
+  }
+
 
   onMount(async () => {
     const startupPref = readStartupPreference();
@@ -4088,8 +4243,21 @@ export default function App() {
 
   createEffect(() => {
     if (booting()) return;
+    if (!isTauriRuntime()) return;
+    if (launchUpdateCheckTriggered()) return;
+
+    const state = updateStatus();
+    if (state.state === "checking" || state.state === "downloading") return;
+
+    setLaunchUpdateCheckTriggered(true);
+    checkForUpdates({ quiet: true }).catch(() => undefined);
+  });
+
+  createEffect(() => {
+    if (booting()) return;
     if (typeof window === "undefined") return;
     if (!isTauriRuntime()) return;
+    if (!launchUpdateCheckTriggered()) return;
     if (!updateAutoCheck()) return;
 
     const maybeRunAutoUpdateCheck = () => {
@@ -4099,8 +4267,6 @@ export default function App() {
       if (!shouldAutoCheckForUpdates()) return;
       checkForUpdates({ quiet: true }).catch(() => undefined);
     };
-
-    maybeRunAutoUpdateCheck();
 
     const interval = window.setInterval(maybeRunAutoUpdateCheck, UPDATE_AUTO_CHECK_POLL_MS);
     onCleanup(() => window.clearInterval(interval));
@@ -4117,9 +4283,29 @@ export default function App() {
     downloadUpdate().catch(() => undefined);
   });
 
+  const headerConnectedVersion = createMemo(() => {
+    const fallbackVersion = connectedVersion()?.trim() ?? "";
+    if (!developerMode()) {
+      return fallbackVersion || null;
+    }
+
+    const openworkVersion =
+      appVersion()?.trim() ||
+      openworkServerDiagnostics()?.version?.trim() ||
+      "";
+    if (!openworkVersion) {
+      return fallbackVersion || null;
+    }
+
+    const normalizedVersion = openworkVersion.startsWith("v")
+      ? openworkVersion
+      : `v${openworkVersion}`;
+    return `OpenWork ${normalizedVersion}`;
+  });
+
   const headerStatus = createMemo(() => {
-    if (!client() || !connectedVersion()) return t("status.disconnected", currentLocale());
-    const bits = [`${t("status.connected", currentLocale())} · ${connectedVersion()}`];
+    if (!client() || !headerConnectedVersion()) return t("status.disconnected", currentLocale());
+    const bits = [`${t("status.connected", currentLocale())} · ${headerConnectedVersion()}`];
     if (sseConnected()) bits.push(t("status.live", currentLocale()));
     return bits.join(" · ");
   });
@@ -4380,6 +4566,14 @@ export default function App() {
       refreshScheduledJobs: (options?: { force?: boolean }) =>
         refreshScheduledJobs(options).catch(() => undefined),
       deleteScheduledJob,
+      soulStatusByWorkspaceId: soulStatusByWorkspaceId(),
+      activeSoulStatus: activeSoulStatus(),
+      activeSoulHeartbeats: activeSoulHeartbeats(),
+      soulStatusBusy: soulStatusBusy(),
+      soulHeartbeatsBusy: soulHeartbeatsBusy(),
+      soulError: soulError(),
+      refreshSoulData: (options?: { force?: boolean }) => refreshSoulData(options).catch(() => undefined),
+      runSoulPrompt,
       activeWorkspaceRoot: workspaceStore.activeWorkspaceRoot().trim(),
       refreshSkills: (options?: { force?: boolean }) => refreshSkills(options).catch(() => undefined),
       refreshHubSkills: (options?: { force?: boolean }) => refreshHubSkills(options).catch(() => undefined),
@@ -4471,6 +4665,9 @@ export default function App() {
       repairOpencodeCache,
       cacheRepairBusy: cacheRepairBusy(),
       cacheRepairResult: cacheRepairResult(),
+      cleanupOpenworkDockerContainers,
+      dockerCleanupBusy: dockerCleanupBusy(),
+      dockerCleanupResult: dockerCleanupResult(),
       notionStatus: notionStatus(),
       notionStatusDetail: notionStatusDetail(),
       notionError: notionError(),
@@ -4575,6 +4772,7 @@ export default function App() {
     retryLastPrompt: retryLastPrompt,
     newTaskDisabled: newTaskDisabled(),
     workspaceSessionGroups: sidebarWorkspaceGroups(),
+    soulStatusByWorkspaceId: soulStatusByWorkspaceId(),
     openRenameWorkspace,
     selectSession: selectSession,
     messages: visibleMessages(),
@@ -4638,6 +4836,7 @@ export default function App() {
 
   const dashboardTabs = new Set<DashboardTab>([
     "scheduled",
+    "soul",
     "skills",
     "plugins",
     "mcp",
@@ -4834,7 +5033,14 @@ export default function App() {
         }
         onConfirmWorker={
           isTauriRuntime()
-            ? (preset, folder) => workspaceStore.createSandboxFlow(preset, folder)
+            ? async (preset, folder) => {
+                const ok = await workspaceStore.createSandboxFlow(preset, folder, {
+                  onReady: async () => {
+                    await createSessionAndOpen();
+                  },
+                });
+                if (!ok) return;
+              }
             : undefined
         }
         workerDisabled={(() => {
@@ -4866,10 +5072,36 @@ export default function App() {
           }
         }}
         workerRetryLabel={t("common.retry", currentLocale())}
+        workerDebugLines={(() => {
+          const doctor = workspaceStore.sandboxDoctorResult?.();
+          const lines: string[] = [];
+          if (!doctor?.debug) return lines;
+          const selected = doctor.debug.selectedBin?.trim();
+          if (selected) lines.push(`selected: ${selected}`);
+          if (doctor.debug.candidates?.length) {
+            lines.push(`candidates: ${doctor.debug.candidates.join(", ")}`);
+          }
+          if (doctor.debug.versionCommand) {
+            const cmd = doctor.debug.versionCommand;
+            lines.push(`docker --version exit=${cmd.status}`);
+            if (cmd.stderr?.trim()) lines.push(`docker --version stderr: ${cmd.stderr.trim()}`);
+          }
+          if (doctor.debug.infoCommand) {
+            const cmd = doctor.debug.infoCommand;
+            lines.push(`docker info exit=${cmd.status}`);
+            if (cmd.stderr?.trim()) lines.push(`docker info stderr: ${cmd.stderr.trim()}`);
+          }
+          return lines;
+        })()}
         onWorkerRetry={() => {
           void workspaceStore.refreshSandboxDoctor?.();
         }}
-        submitting={busy() && busyLabel() === "status.creating_workspace"}
+        workerSubmitting={workspaceStore.sandboxPreflightBusy?.() ?? false}
+        submitting={(() => {
+          const phase = workspaceStore.sandboxCreatePhase?.() ?? "idle";
+          if (phase === "provisioning" || phase === "finalizing") return true;
+          return busy() && busyLabel() === "status.creating_workspace";
+        })()}
         submittingProgress={workspaceStore.sandboxCreateProgress?.() ?? null}
       />
 

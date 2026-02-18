@@ -15,10 +15,17 @@ import type {
   View,
 } from "../types";
 import type { McpDirectoryInfo } from "../constants";
-import { formatRelativeTime, isTauriRuntime, normalizeDirectoryPath } from "../utils";
+import {
+  formatRelativeTime,
+  getWorkspaceTaskLoadErrorDisplay,
+  isTauriRuntime,
+  normalizeDirectoryPath,
+} from "../utils";
 import { buildOpenworkWorkspaceBaseUrl, createOpenworkServerClient } from "../lib/openwork-server";
 import type {
   OpenworkAuditEntry,
+  OpenworkSoulHeartbeatEntry,
+  OpenworkSoulStatus,
   OpenworkServerClient,
   OpenworkServerCapabilities,
   OpenworkServerDiagnostics,
@@ -30,6 +37,7 @@ import type { EngineInfo, OrchestratorStatus, OpenworkServerInfo, OpenCodeRouter
 import Button from "../components/button";
 import ExtensionsView from "./extensions";
 import ScheduledTasksView from "./scheduled";
+import SoulView from "./soul";
 import ConfigView from "./config";
 import SettingsView from "./settings";
 import SkillsView from "./skills";
@@ -42,6 +50,7 @@ import {
   ChevronDown,
   ChevronRight,
   History,
+  HeartPulse,
   Loader2,
   MessageCircle,
   MoreHorizontal,
@@ -133,6 +142,14 @@ export type DashboardViewProps = {
   scheduledJobsUpdatedAt: number | null;
   refreshScheduledJobs: (options?: { force?: boolean }) => void;
   deleteScheduledJob: (name: string) => Promise<void> | void;
+  soulStatusByWorkspaceId: Record<string, OpenworkSoulStatus | null>;
+  activeSoulStatus: OpenworkSoulStatus | null;
+  activeSoulHeartbeats: OpenworkSoulHeartbeatEntry[];
+  soulStatusBusy: boolean;
+  soulHeartbeatsBusy: boolean;
+  soulError: string | null;
+  refreshSoulData: (options?: { force?: boolean }) => void;
+  runSoulPrompt: (prompt: string) => void;
   activeWorkspaceRoot: string;
   refreshSkills: (options?: { force?: boolean }) => void;
   refreshHubSkills: (options?: { force?: boolean }) => void;
@@ -251,6 +268,9 @@ export type DashboardViewProps = {
   repairOpencodeCache: () => void;
   cacheRepairBusy: boolean;
   cacheRepairResult: string | null;
+  cleanupOpenworkDockerContainers: () => void;
+  dockerCleanupBusy: boolean;
+  dockerCleanupResult: string | null;
   notionStatus: "disconnected" | "connecting" | "connected" | "error";
   notionStatusDetail: string | null;
   notionError: string | null;
@@ -263,6 +283,8 @@ export default function DashboardView(props: DashboardViewProps) {
     switch (props.tab) {
       case "scheduled":
         return "Automations";
+      case "soul":
+        return "Soul";
       case "skills":
         return "Skills";
       case "plugins":
@@ -270,7 +292,7 @@ export default function DashboardView(props: DashboardViewProps) {
       case "mcp":
         return "Extensions";
       case "identities":
-        return "Identities";
+        return "Messaging";
       case "config":
         return "Advanced";
       case "settings":
@@ -288,7 +310,9 @@ export default function DashboardView(props: DashboardViewProps) {
     "Worker";
   const workspaceKindLabel = (workspace: WorkspaceInfo) =>
     workspace.workspaceType === "remote"
-      ? workspace.sandboxContainerName?.trim()
+      ? workspace.sandboxBackend === "docker" ||
+        Boolean(workspace.sandboxRunId?.trim()) ||
+        Boolean(workspace.sandboxContainerName?.trim())
         ? "Sandbox"
         : "Remote"
       : "Local";
@@ -471,6 +495,9 @@ export default function DashboardView(props: DashboardViewProps) {
         if (currentTab === "scheduled" && !cancelled) {
           await props.refreshScheduledJobs();
         }
+        if (currentTab === "soul" && !cancelled) {
+          await props.refreshSoulData();
+        }
       } catch {
         // Ignore errors during navigation
       } finally {
@@ -511,8 +538,25 @@ export default function DashboardView(props: DashboardViewProps) {
   };
 
   const openConfig = () => {
-    props.setTab("config");
+    props.setTab(props.developerMode ? "config" : "identities");
   };
+
+  const openSoulForWorkspace = (workspaceId?: string) => {
+    const id = (workspaceId ?? props.activeWorkspaceId).trim();
+    if (!id) return;
+    void (async () => {
+      if (id !== props.activeWorkspaceId) {
+        await Promise.resolve(props.activateWorkspace(id));
+      }
+      props.setTab("soul");
+    })();
+  };
+
+  createEffect(() => {
+    if (props.developerMode) return;
+    if (props.tab !== "config") return;
+    props.setTab("identities");
+  });
 
   const shareWorkspace = createMemo(() => {
     const id = shareWorkspaceId();
@@ -682,13 +726,32 @@ export default function DashboardView(props: DashboardViewProps) {
     return state === "available" || state === "downloading" || state === "ready";
   });
 
+  const updateDownloadPercent = createMemo<number | null>(() => {
+    const total = props.updateStatus?.totalBytes;
+    if (total == null || total <= 0) return null;
+    const downloaded = props.updateStatus?.downloadedBytes ?? 0;
+    const clamped = Math.max(0, Math.min(1, downloaded / total));
+    return Math.floor(clamped * 100);
+  });
+
   const updatePillLabel = createMemo(() => {
     const state = props.updateStatus?.state;
     if (state === "ready") {
-      return props.anyActiveRuns ? "Update ready" : "Restart";
+      return props.anyActiveRuns ? "Update ready" : "Install update";
     }
-    if (state === "downloading") return "Downloading";
+    if (state === "downloading") {
+      const percent = updateDownloadPercent();
+      return percent == null ? "Downloading" : `Downloading ${percent}%`;
+    }
     return "Update available";
+  });
+
+  const updatePillTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return "border-transparent bg-green-9 text-white shadow-[0_2px_10px_rgba(22,163,74,0.35)] hover:bg-green-10";
+    }
+    return "border-transparent bg-dls-accent text-white shadow-[0_2px_10px_rgba(var(--dls-accent-rgb),0.35)] hover:bg-[var(--dls-accent-hover)]";
   });
 
   const updatePillTitle = createMemo(() => {
@@ -719,7 +782,7 @@ export default function DashboardView(props: DashboardViewProps) {
           <Show when={showUpdatePill()}>
             <button
               type="button"
-              class="mb-3 w-full flex h-9 items-center gap-2 rounded-xl border border-dls-border bg-dls-hover px-3 text-xs text-dls-secondary shadow-sm transition-colors hover:bg-dls-active hover:text-dls-text"
+              class={`mb-3 w-full flex h-9 items-center gap-2 rounded-xl border px-3 text-xs font-medium transition-all hover:-translate-y-[1px] ${updatePillTone()}`}
               onClick={handleUpdatePillClick}
               title={updatePillTitle()}
               aria-label={updatePillTitle()}
@@ -727,26 +790,19 @@ export default function DashboardView(props: DashboardViewProps) {
               <Show
                 when={props.updateStatus?.state === "downloading"}
                 fallback={
-                  <span
-                    class={`w-2 h-2 rounded-full ${
-                      props.updateStatus?.state === "ready" ? "bg-green-9" : "bg-amber-9"
-                    }`}
-                  />
+                  <span class="w-2 h-2 rounded-full bg-white/85" />
                 }
               >
-                <Loader2 size={14} class="animate-spin text-dls-secondary" />
+                <Loader2 size={14} class="animate-spin text-white/90" />
               </Show>
-              <span class="text-[11px] font-medium text-dls-text">{updatePillLabel()}</span>
+              <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
               <Show when={props.updateStatus?.version}>
                 {(version) => (
-                  <span class="ml-auto text-[11px] text-dls-secondary font-mono">v{version()}</span>
+                  <span class="ml-auto text-[11px] text-white/80 font-mono">v{version()}</span>
                 )}
               </Show>
             </button>
           </Show>
-          <div class="flex items-center text-[11px] font-bold text-dls-secondary uppercase px-3 mb-3 pt-2 tracking-tight">
-            <span>Tasks</span>
-          </div>
 
           <div class="space-y-3 mb-3">
             <For each={props.workspaceSessionGroups}>
@@ -754,6 +810,9 @@ export default function DashboardView(props: DashboardViewProps) {
                 const workspace = () => group.workspace;
                 const isConnecting = () => props.connectingWorkspaceId === workspace().id;
                 const isMenuOpen = () => workspaceMenuId() === workspace().id;
+                const taskLoadError = () => getWorkspaceTaskLoadErrorDisplay(workspace(), group.error);
+                const soulStatus = () => props.soulStatusByWorkspaceId[workspace().id] ?? null;
+                const soulEnabled = () => Boolean(soulStatus()?.enabled);
 
                 return (
                   <div class="space-y-1">
@@ -792,8 +851,14 @@ export default function DashboardView(props: DashboardViewProps) {
                         </button>
                         <div class="min-w-0 flex-1">
                           <div class="text-sm font-medium truncate">{workspaceLabel(workspace())}</div>
-                          <div class="text-[11px] text-dls-secondary">
-                            {workspaceKindLabel(workspace())}
+                          <div class="text-[11px] text-dls-secondary flex items-center gap-1.5">
+                            <span>{workspaceKindLabel(workspace())}</span>
+                            <Show when={soulEnabled()}>
+                              <span class="inline-flex items-center gap-1 rounded-full border border-rose-7/40 bg-rose-3/40 px-1.5 py-0.5 text-[10px] text-rose-11">
+                                <HeartPulse size={10} />
+                                Soul
+                              </span>
+                            </Show>
                           </div>
                         </div>
                         <Show when={group.status === "loading"}>
@@ -801,10 +866,14 @@ export default function DashboardView(props: DashboardViewProps) {
                         </Show>
                         <Show when={group.status === "error"}>
                           <span
-                            class="text-[10px] px-2 py-0.5 rounded-full border border-red-7/50 text-red-11 bg-red-3/30"
-                            title={group.error ?? "Failed to load tasks"}
+                            class={`text-[10px] px-2 py-0.5 rounded-full border ${
+                              taskLoadError().tone === "offline"
+                                ? "border-amber-7/50 text-amber-11 bg-amber-3/30"
+                                : "border-red-7/50 text-red-11 bg-red-3/30"
+                            }`}
+                            title={taskLoadError().title}
                           >
-                            Error
+                            {taskLoadError().label}
                           </span>
                         </Show>
                         {/* Session count intentionally hidden (not a useful signal and it can crowd the header actions). */}
@@ -864,6 +933,16 @@ export default function DashboardView(props: DashboardViewProps) {
                             }}
                           >
                             Share...
+                          </button>
+                          <button
+                            type="button"
+                            class="w-full text-left px-2 py-1.5 text-sm rounded-md hover:bg-dls-hover"
+                            onClick={() => {
+                              openSoulForWorkspace(workspace().id);
+                              setWorkspaceMenuId(null);
+                            }}
+                          >
+                            {soulEnabled() ? "Soul settings" : "Enable soul"}
                           </button>
                           <Show when={workspace().workspaceType === "remote"}>
                             <button
@@ -961,10 +1040,14 @@ export default function DashboardView(props: DashboardViewProps) {
                               fallback={
                                 <Show when={group.status === "error"}>
                                   <div
-                                    class="w-full px-3 py-2 text-xs text-red-11 ml-2 text-left rounded-lg bg-red-3/20 border border-red-7/40"
-                                    title={group.error ?? "Failed to load tasks"}
+                                    class={`w-full px-3 py-2 text-xs ml-2 text-left rounded-lg border ${
+                                      taskLoadError().tone === "offline"
+                                        ? "text-amber-11 bg-amber-3/20 border-amber-7/40"
+                                        : "text-red-11 bg-red-3/20 border-red-7/40"
+                                    }`}
+                                    title={taskLoadError().title}
                                   >
-                                    Failed to load tasks
+                                    {taskLoadError().message}
                                   </div>
                                 </Show>
                               }
@@ -1095,7 +1178,7 @@ export default function DashboardView(props: DashboardViewProps) {
             <Show when={showUpdatePill()}>
               <button
                 type="button"
-                class="md:hidden flex h-8 items-center gap-2 rounded-full border border-dls-border bg-dls-hover px-3 text-xs text-dls-secondary shadow-sm transition-colors hover:bg-dls-active hover:text-dls-text"
+                class={`md:hidden flex h-8 items-center gap-2 rounded-full border px-3 text-xs font-medium transition-colors ${updatePillTone()}`}
                 onClick={handleUpdatePillClick}
                 title={updatePillTitle()}
                 aria-label={updatePillTitle()}
@@ -1103,19 +1186,15 @@ export default function DashboardView(props: DashboardViewProps) {
                 <Show
                   when={props.updateStatus?.state === "downloading"}
                   fallback={
-                    <span
-                      class={`w-2 h-2 rounded-full ${
-                        props.updateStatus?.state === "ready" ? "bg-green-9" : "bg-amber-9"
-                      }`}
-                    />
+                    <span class="w-2 h-2 rounded-full bg-white/85" />
                   }
                 >
-                  <Loader2 size={14} class="animate-spin text-dls-secondary" />
+                  <Loader2 size={14} class="animate-spin text-white/90" />
                 </Show>
-                <span class="text-[11px] font-medium text-dls-text">{updatePillLabel()}</span>
+                <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
                 <Show when={props.updateStatus?.version}>
                   {(version) => (
-                    <span class="hidden sm:inline text-[11px] text-dls-secondary font-mono">v{version()}</span>
+                    <span class="hidden sm:inline text-[11px] text-white/80 font-mono">v{version()}</span>
                   )}
                 </Show>
               </button>
@@ -1123,6 +1202,12 @@ export default function DashboardView(props: DashboardViewProps) {
             <div class="px-3 py-1.5 rounded-xl bg-dls-hover text-xs text-dls-secondary font-medium">
               {props.activeWorkspaceDisplay.name}
             </div>
+            <Show when={props.activeSoulStatus?.enabled}>
+              <div class="inline-flex items-center gap-1 rounded-full border border-rose-7/40 bg-rose-3/40 px-2 py-1 text-[11px] text-rose-11">
+                <HeartPulse size={11} />
+                Soul on
+              </div>
+            </Show>
             <h1 class="text-lg font-medium">{title()}</h1>
             <Show when={props.developerMode}>
               <span class="text-xs text-dls-secondary">{props.headerStatus}</span>
@@ -1151,6 +1236,20 @@ export default function DashboardView(props: DashboardViewProps) {
                 createSessionAndOpen={props.createSessionAndOpen}
                 setPrompt={props.setPrompt}
                 newTaskDisabled={props.newTaskDisabled}
+              />
+            </Match>
+            <Match when={props.tab === "soul"}>
+              <SoulView
+                workspaceName={props.activeWorkspaceDisplay.name}
+                workspaceRoot={props.activeWorkspaceRoot}
+                status={props.activeSoulStatus}
+                heartbeats={props.activeSoulHeartbeats}
+                loading={props.soulStatusBusy}
+                loadingHeartbeats={props.soulHeartbeatsBusy}
+                error={props.soulError}
+                newTaskDisabled={props.newTaskDisabled}
+                refresh={props.refreshSoulData}
+                runSoulPrompt={props.runSoulPrompt}
               />
             </Match>
             <Match when={props.tab === "skills"}>
@@ -1231,7 +1330,7 @@ export default function DashboardView(props: DashboardViewProps) {
               />
             </Match>
 
-            <Match when={props.tab === "config"}>
+            <Match when={props.tab === "config" && props.developerMode}>
               <ConfigView
                 busy={props.busy}
                 clientConnected={props.clientConnected}
@@ -1328,6 +1427,9 @@ export default function DashboardView(props: DashboardViewProps) {
                   repairOpencodeCache={props.repairOpencodeCache}
                   cacheRepairBusy={props.cacheRepairBusy}
                   cacheRepairResult={props.cacheRepairResult}
+                  cleanupOpenworkDockerContainers={props.cleanupOpenworkDockerContainers}
+                  dockerCleanupBusy={props.dockerCleanupBusy}
+                  dockerCleanupResult={props.dockerCleanupResult}
                   notionStatus={props.notionStatus}
                   notionStatusDetail={props.notionStatusDetail}
                   notionError={props.notionError}
@@ -1418,7 +1520,7 @@ export default function DashboardView(props: DashboardViewProps) {
           mcpStatuses={props.mcpStatuses}
         />
         <nav class="md:hidden border-t border-dls-border bg-dls-surface">
-          <div class="mx-auto max-w-5xl px-4 py-3 grid grid-cols-5 gap-2">
+          <div class={`mx-auto max-w-5xl px-4 py-3 grid gap-2 ${props.developerMode ? "grid-cols-6" : "grid-cols-5"}`}>
             <button
               class={`flex flex-col items-center gap-1 text-xs ${
                 props.tab === "scheduled" ? "text-gray-12" : "text-gray-10"
@@ -1427,6 +1529,15 @@ export default function DashboardView(props: DashboardViewProps) {
             >
               <History size={18} />
               Automations
+            </button>
+            <button
+              class={`flex flex-col items-center gap-1 text-xs ${
+                props.tab === "soul" ? "text-gray-12" : "text-gray-10"
+              }`}
+              onClick={() => props.setTab("soul")}
+            >
+              <HeartPulse size={18} />
+              Soul
             </button>
             <button
               class={`flex flex-col items-center gap-1 text-xs ${
@@ -1455,15 +1566,17 @@ export default function DashboardView(props: DashboardViewProps) {
               <MessageCircle size={18} />
               IDs
             </button>
-            <button
-              class={`flex flex-col items-center gap-1 text-xs ${
-                props.tab === "config" ? "text-gray-12" : "text-gray-10"
-              }`}
-              onClick={() => props.setTab("config")}
-            >
-              <SlidersHorizontal size={18} />
-              Advanced
-            </button>
+            <Show when={props.developerMode}>
+              <button
+                class={`flex flex-col items-center gap-1 text-xs ${
+                  props.tab === "config" ? "text-gray-12" : "text-gray-10"
+                }`}
+                onClick={() => props.setTab("config")}
+              >
+                <SlidersHorizontal size={18} />
+                Advanced
+              </button>
+            </Show>
           </div>
         </nav>
       </main>
@@ -1471,10 +1584,11 @@ export default function DashboardView(props: DashboardViewProps) {
       <aside class="w-56 hidden md:flex flex-col bg-dls-sidebar border-l border-dls-border p-4">
         <div class="space-y-1 pt-2">
           {navItem("scheduled", "Automations", <History size={18} />)}
+          {navItem("soul", "Soul", <HeartPulse size={18} />)}
           {navItem("skills", "Skills", <Zap size={18} />)}
           {navItem("mcp", "Extensions", <Box size={18} />)}
-          {navItem("identities", "Identities", <MessageCircle size={18} />)}
-          {navItem("config", "Advanced", <SlidersHorizontal size={18} />)}
+          {navItem("identities", "Messaging", <MessageCircle size={18} />)}
+          <Show when={props.developerMode}>{navItem("config", "Advanced", <SlidersHorizontal size={18} />)}</Show>
         </div>
       </aside>
     </div>
