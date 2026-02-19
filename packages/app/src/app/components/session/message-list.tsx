@@ -4,8 +4,9 @@ import type { Part } from "@opencode-ai/sdk/v2/client";
 import { Check, ChevronDown, ChevronRight, Copy, Eye, File, FileEdit, FolderSearch, Pencil, Search, Sparkles, Terminal } from "lucide-solid";
 
 import type { MessageGroup, MessageWithParts } from "../../types";
-import { classifyTool, groupMessageParts, summarizeStep } from "../../utils";
+import { groupMessageParts, summarizeStep } from "../../utils";
 import PartView from "../part-view";
+import { perfNow, recordPerfLog } from "../../lib/perf-log";
 
 export type MessageListProps = {
   messages: MessageWithParts[];
@@ -195,6 +196,7 @@ export default function MessageList(props: MessageListProps) {
     });
 
   const messageBlocks = createMemo<MessageBlockItem[]>(() => {
+    const startedAt = perfNow();
     const blocks: MessageBlockItem[] = [];
 
     for (const message of props.messages) {
@@ -237,26 +239,23 @@ export default function MessageList(props: MessageListProps) {
       });
     }
 
+    const elapsedMs = Math.round((perfNow() - startedAt) * 100) / 100;
+    if (props.developerMode && (elapsedMs >= 8 || props.messages.length >= 120)) {
+      recordPerfLog(true, "session.render", "message-blocks", {
+        messageCount: props.messages.length,
+        blockCount: blocks.length,
+        ms: elapsedMs,
+      });
+    }
+
     return blocks;
   });
 
   /** Compact single-line step row */
   const StepRow = (rowProps: { part: Part; isUser: boolean }) => {
-    const summary = () => summarizeStep(rowProps.part);
-    const category = () => {
-      if (rowProps.part.type === "tool") {
-        const toolName = (rowProps.part as any).tool ? String((rowProps.part as any).tool) : "";
-        return classifyTool(toolName);
-      }
-      return "tool";
-    };
-    const status = () => {
-      if (rowProps.part.type === "tool") {
-        const state = (rowProps.part as any).state ?? {};
-        return state.status ? String(state.status) : undefined;
-      }
-      return undefined;
-    };
+    const summary = createMemo(() => summarizeStep(rowProps.part));
+    const category = createMemo(() => summary().toolCategory ?? "tool");
+    const status = createMemo(() => summary().status);
 
     return (
       <div class="flex items-center gap-2.5 py-1.5 min-h-[28px] group/step">

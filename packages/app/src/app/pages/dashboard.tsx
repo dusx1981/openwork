@@ -318,20 +318,16 @@ export default function DashboardView(props: DashboardViewProps) {
       : "Local";
 
   const openSessionFromList = (workspaceId: string, sessionId: string) => {
-    // For same-workspace clicks, just select the session without workspace activation
+    // Route-driven selection: navigate first and let the route effect own selectSession.
     if (workspaceId === props.activeWorkspaceId) {
-      void props.selectSession(sessionId);
       props.setView("session", sessionId);
       return;
     }
     // For different workspace, activate workspace first
-    window.setTimeout(() => {
-      void (async () => {
-        await Promise.resolve(props.activateWorkspace(workspaceId));
-        void props.selectSession(sessionId);
-        props.setView("session", sessionId);
-      })();
-    }, 0);
+    void (async () => {
+      await Promise.resolve(props.activateWorkspace(workspaceId));
+      props.setView("session", sessionId);
+    })();
   };
 
   const createTaskInWorkspace = (workspaceId: string) => {
@@ -514,6 +510,13 @@ export default function DashboardView(props: DashboardViewProps) {
       setRefreshInProgress(false);
     });
   });
+
+  const soulModeEnabled = createMemo(() => {
+    const status = props.soulStatusByWorkspaceId[props.activeWorkspaceId];
+    return Boolean(status?.enabled ?? props.activeSoulStatus?.enabled);
+  });
+
+  const soulNavIconClass = () => (soulModeEnabled() ? "soul-nav-icon-active" : "");
 
   const navItem = (t: DashboardTab, label: any, icon: any) => {
     const active = () => props.tab === t || (t === "mcp" && props.tab === "plugins");
@@ -1280,6 +1283,7 @@ export default function DashboardView(props: DashboardViewProps) {
             <Match when={props.tab === "plugins" || props.tab === "mcp"}>
               <ExtensionsView
                 initialSection={props.tab === "plugins" ? "plugins" : "mcp"}
+                setDashboardTab={props.setTab}
                 busy={props.busy}
                 activeWorkspaceRoot={props.activeWorkspaceRoot}
                 refreshMcpServers={props.refreshMcpServers}
@@ -1536,7 +1540,7 @@ export default function DashboardView(props: DashboardViewProps) {
               }`}
               onClick={() => props.setTab("soul")}
             >
-              <HeartPulse size={18} />
+              <HeartPulse size={18} class={soulNavIconClass()} />
               Soul
             </button>
             <button
@@ -1584,7 +1588,7 @@ export default function DashboardView(props: DashboardViewProps) {
       <aside class="w-56 hidden md:flex flex-col bg-dls-sidebar border-l border-dls-border p-4">
         <div class="space-y-1 pt-2">
           {navItem("scheduled", "Automations", <History size={18} />)}
-          {navItem("soul", "Soul", <HeartPulse size={18} />)}
+          {navItem("soul", "Soul", <HeartPulse size={18} class={soulNavIconClass()} />)}
           {navItem("skills", "Skills", <Zap size={18} />)}
           {navItem("mcp", "Extensions", <Box size={18} />)}
           {navItem("identities", "Messaging", <MessageCircle size={18} />)}
