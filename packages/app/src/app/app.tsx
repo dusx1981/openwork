@@ -832,16 +832,85 @@ export default function App() {
   const assertNoClientError = (result: unknown) => {
     const maybe = result as { error?: unknown } | null | undefined;
     if (!maybe || maybe.error === undefined) return;
-    const message =
-      maybe.error instanceof Error
-        ? maybe.error.message
-        : typeof maybe.error === "string"
-          ? maybe.error
-          : JSON.stringify(maybe.error);
-    throw new Error(message || "Unknown error");
+    throw new Error(describeProviderError(maybe.error, "Request failed"));
+  };
+
+  const describeProviderError = (error: unknown, fallback: string) => {
+    const readString = (value: unknown, max = 700) => {
+      if (typeof value !== "string") return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      if (trimmed.length <= max) return trimmed;
+      return `${trimmed.slice(0, Math.max(0, max - 3))}...`;
+    };
+
+    const records: Record<string, unknown>[] = [];
+    const root = error && typeof error === "object" ? (error as Record<string, unknown>) : null;
+    if (root) {
+      records.push(root);
+      if (root.data && typeof root.data === "object") records.push(root.data as Record<string, unknown>);
+      if (root.cause && typeof root.cause === "object") {
+        const cause = root.cause as Record<string, unknown>;
+        records.push(cause);
+        if (cause.data && typeof cause.data === "object") records.push(cause.data as Record<string, unknown>);
+      }
+    }
+
+    const firstString = (keys: string[]) => {
+      for (const record of records) {
+        for (const key of keys) {
+          const value = readString(record[key]);
+          if (value) return value;
+        }
+      }
+      return null;
+    };
+
+    const firstNumber = (keys: string[]) => {
+      for (const record of records) {
+        for (const key of keys) {
+          const value = record[key];
+          if (typeof value === "number" && Number.isFinite(value)) return value;
+        }
+      }
+      return null;
+    };
+
+    const status = firstNumber(["statusCode", "status"]);
+    const provider = firstString(["providerID", "providerId", "provider"]);
+    const code = firstString(["code", "errorCode"]);
+    const response = firstString(["responseBody", "body", "response"]);
+    const raw =
+      (error instanceof Error ? readString(error.message) : null) ||
+      firstString(["message", "detail", "reason", "error"]) ||
+      (typeof error === "string" ? readString(error) : null);
+
+    const generic = raw && /^unknown\s+error$/i.test(raw);
+    const heading = (() => {
+      if (status === 401 || status === 403) return "Authentication failed";
+      if (status === 429) return "Rate limit exceeded";
+      if (provider) return `Provider error (${provider})`;
+      return fallback;
+    })();
+
+    const lines = [heading];
+    if (raw && !generic && raw !== heading) lines.push(raw);
+    if (status && !heading.includes(String(status))) lines.push(`Status: ${status}`);
+    if (provider && !heading.includes(provider)) lines.push(`Provider: ${provider}`);
+    if (code) lines.push(`Code: ${code}`);
+    if (response) lines.push(`Response: ${response}`);
+    if (lines.length > 1) return lines.join("\n");
+
+    if (raw && !generic) return raw;
+    if (error && typeof error === "object") {
+      const serialized = safeStringify(error);
+      if (serialized && serialized !== "{}") return serialized;
+    }
+    return fallback;
   };
 
   async function sendPrompt(draft?: ComposerDraft) {
+    const hasExplicitDraft = Boolean(draft);
     const fallbackText = prompt().trim();
     const resolvedDraft: ComposerDraft = draft ?? {
       mode: "prompt",
@@ -893,7 +962,9 @@ export default function App() {
       if (!compactCommand) {
         setLastPromptSent(content);
       }
-      setPrompt("");
+      if (!hasExplicitDraft) {
+        setPrompt("");
+      }
 
       const model = selectedSessionModel();
       const agent = selectedSessionAgent();
@@ -1345,7 +1416,7 @@ export default function App() {
 
       return auth.instructions || `Opened ${resolved} auth in browser`;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to connect provider";
+      const message = describeProviderError(error, "Failed to connect provider");
       setProviderAuthError(message);
       throw error instanceof Error ? error : new Error(message);
     }
@@ -1372,7 +1443,7 @@ export default function App() {
       globalSync.set("provider", updated);
       return `Connected ${providerId}`;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to save API key";
+      const message = describeProviderError(error, "Failed to save API key");
       setProviderAuthError(message);
       throw error instanceof Error ? error : new Error(message);
     }
@@ -1386,7 +1457,7 @@ export default function App() {
       setProviderAuthMethods(methods);
       setProviderAuthModalOpen(true);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to load providers";
+      const message = describeProviderError(error, "Failed to load providers");
       setProviderAuthError(message);
       throw error;
     } finally {
@@ -2018,12 +2089,22 @@ export default function App() {
 
   createEffect(() => {
     const allSessions = sessions(); // reactive dependency on session store
-    const wsId = workspaceStore.activeWorkspaceId();
+    const wsId = workspaceStore.activeWorkspaceId().trim();
+    if (!wsId) return;
     const status = sidebarSessionStatusByWorkspaceId()[wsId];
 
     // Only sync if sidebar is already in 'ready' state (not during initial load)
     if (status === "ready") {
-      const sorted = sortSessionsByActivity(allSessions);
+      const activeWorkspace = workspaceStore.workspaces().find((workspace) => workspace.id === wsId) ?? null;
+      const activeWorkspaceRoot = normalizeDirectoryPath(
+        activeWorkspace?.workspaceType === "local"
+          ? activeWorkspace.path
+          : activeWorkspace?.directory ?? activeWorkspace?.path,
+      );
+      const scopedSessions = activeWorkspaceRoot
+        ? allSessions.filter((session) => normalizeDirectoryPath(session.directory) === activeWorkspaceRoot)
+        : allSessions;
+      const sorted = sortSessionsByActivity(scopedSessions);
       setSidebarSessionsByWorkspaceId((prev) => ({
         ...prev,
         [wsId]: sorted.map((s) => ({
@@ -2614,6 +2695,8 @@ export default function App() {
     return openworkServerStatus() === "connected" && Boolean(client && workspaceId);
   });
 
+  const schedulerPluginInstalled = createMemo(() => isPluginInstalledByName("opencode-scheduler"));
+
   const refreshScheduledJobs = async (options?: { force?: boolean }) => {
     if (scheduledJobsBusy() && !options?.force) return;
 
@@ -2656,6 +2739,12 @@ export default function App() {
     }
 
     if (isWindowsPlatform()) {
+      setScheduledJobs([]);
+      setScheduledJobsStatus(null);
+      return;
+    }
+
+    if (!schedulerPluginInstalled()) {
       setScheduledJobs([]);
       setScheduledJobsStatus(null);
       return;
@@ -2868,6 +2957,22 @@ export default function App() {
   const activeAuthorizedDirs = createMemo(() => workspaceStore.authorizedDirs());
   const activeWorkspaceDisplay = createMemo(() => workspaceStore.activeWorkspaceDisplay());
   const activePermissionMemo = createMemo(() => activePermission());
+  const migrationRepairUnavailableReason = createMemo<string | null>(() => {
+    if (workspaceStore.canRepairOpencodeMigration()) return null;
+    if (!isTauriRuntime()) {
+      return t("app.migration.desktop_required", currentLocale());
+    }
+
+    if (activeWorkspaceDisplay().workspaceType !== "local") {
+      return t("app.migration.local_only", currentLocale());
+    }
+
+    if (!workspaceStore.activeWorkspacePath().trim()) {
+      return t("app.migration.workspace_required", currentLocale());
+    }
+
+    return t("app.migration.local_only", currentLocale());
+  });
 
   const [expandedStepIds, setExpandedStepIds] = createSignal<Set<string>>(
     new Set()
@@ -3829,8 +3934,21 @@ export default function App() {
   function runSoulPrompt(promptText: string) {
     const text = promptText.trim();
     if (!text) return;
-    setPrompt(text);
-    void createSessionAndOpen();
+    void (async () => {
+      const sessionId = await createSessionAndOpen();
+      if (!sessionId) {
+        setPrompt(text);
+        return;
+      }
+
+      await sendPrompt({
+        mode: "prompt",
+        text,
+        resolvedText: text,
+        parts: [{ type: "text", text }],
+        attachments: [],
+      });
+    })();
   }
 
 
@@ -4015,6 +4133,11 @@ export default function App() {
         setUpdateEnv(await updaterEnvironment());
       } catch {
         // ignore
+      }
+
+      if (!launchUpdateCheckTriggered()) {
+        setLaunchUpdateCheckTriggered(true);
+        checkForUpdates({ quiet: true }).catch(() => undefined);
       }
     }
 
@@ -4524,6 +4647,10 @@ export default function App() {
     engineDoctorCheckedAt: engineDoctorCheckedAt(),
     engineInstallLogs: engineInstallLogs(),
     error: error(),
+    canRepairMigration: workspaceStore.canRepairOpencodeMigration(),
+    migrationRepairUnavailableReason: migrationRepairUnavailableReason(),
+    migrationRepairBusy: workspaceStore.migrationRepairBusy(),
+    migrationRepairResult: workspaceStore.migrationRepairResult(),
     isWindows: isWindowsPlatform(),
     onClientDirectoryChange: setClientDirectory,
     onOpenworkHostUrlChange: (value: string) =>
@@ -4539,6 +4666,7 @@ export default function App() {
     onSelectStartup: workspaceStore.onSelectStartup,
     onRememberStartupToggle: workspaceStore.onRememberStartupToggle,
     onStartHost: workspaceStore.onStartHost,
+    onRepairMigration: workspaceStore.onRepairOpencodeMigration,
     onCreateWorkspace: workspaceStore.createWorkspaceFlow,
     onPickWorkspaceFolder: workspaceStore.pickWorkspaceFolder,
     onImportWorkspaceConfig: workspaceStore.importWorkspaceConfig,
@@ -4681,6 +4809,7 @@ export default function App() {
       scheduledJobs: scheduledJobs(),
       scheduledJobsSource: scheduledJobsSource(),
       scheduledJobsSourceReady: scheduledJobsSourceReady(),
+      schedulerPluginInstalled: schedulerPluginInstalled(),
       scheduledJobsStatus: scheduledJobsStatus(),
       scheduledJobsBusy: scheduledJobsBusy(),
       scheduledJobsUpdatedAt: scheduledJobsUpdatedAt(),
@@ -4783,6 +4912,11 @@ export default function App() {
       workspaceDebugEvents: workspaceStore.workspaceDebugEvents(),
       clearWorkspaceDebugEvents: workspaceStore.clearWorkspaceDebugEvents,
       safeStringify,
+      repairOpencodeMigration: workspaceStore.repairOpencodeMigration,
+      migrationRepairBusy: workspaceStore.migrationRepairBusy(),
+      migrationRepairResult: workspaceStore.migrationRepairResult(),
+      migrationRepairAvailable: workspaceStore.canRepairOpencodeMigration(),
+      migrationRepairUnavailableReason: migrationRepairUnavailableReason(),
       repairOpencodeCache,
       cacheRepairBusy: cacheRepairBusy(),
       cacheRepairResult: cacheRepairResult(),

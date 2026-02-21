@@ -3,7 +3,7 @@ import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onMou
 import { formatBytes, formatRelativeTime, isTauriRuntime } from "../utils";
 
 import Button from "../components/button";
-import { HardDrive, MessageCircle, PlugZap, RefreshCcw, Shield, Smartphone, X } from "lucide-solid";
+import { CircleAlert, HardDrive, MessageCircle, PlugZap, RefreshCcw, Smartphone, X, Zap } from "lucide-solid";
 import type { OpencodeConnectStatus, ProviderListItem, SettingsTab, StartupPreference } from "../types";
 import type {
   OpenworkAuditEntry,
@@ -26,6 +26,7 @@ import {
   opencodeRouterStop,
   pickFile,
 } from "../lib/tauri";
+import { currentLocale, t } from "../../i18n";
 
 export type SettingsViewProps = {
   startupPreference: StartupPreference | null;
@@ -102,6 +103,11 @@ export type SettingsViewProps = {
   workspaceDebugEvents: unknown;
   clearWorkspaceDebugEvents: () => void;
   safeStringify: (value: unknown) => string;
+  repairOpencodeMigration: () => void;
+  migrationRepairBusy: boolean;
+  migrationRepairResult: { ok: boolean; message: string } | null;
+  migrationRepairAvailable: boolean;
+  migrationRepairUnavailableReason: string | null;
   repairOpencodeCache: () => void;
   cacheRepairBusy: boolean;
   cacheRepairResult: string | null;
@@ -143,6 +149,7 @@ export function OpenCodeRouterSettings(_props: {
 
 
 export default function SettingsView(props: SettingsViewProps) {
+  const translate = (key: string) => t(key, currentLocale());
   const engineCustomBinPathLabel = () => props.engineCustomBinPath.trim() || "No binary selected.";
 
   const handlePickEngineBinary = async () => {
@@ -642,6 +649,11 @@ export default function SettingsView(props: SettingsViewProps) {
     return formatRelativeTime(Date.now() - uptimeMs);
   };
 
+  const compactOutlineActionClass =
+    "inline-flex items-center gap-1.5 rounded-md border border-dls-border bg-dls-surface px-3 py-1.5 text-xs font-medium text-dls-secondary shadow-sm transition-colors duration-150 hover:bg-dls-hover hover:text-dls-text focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--dls-accent-rgb),0.25)] disabled:cursor-not-allowed disabled:opacity-60";
+  const compactDangerActionClass =
+    "inline-flex items-center gap-1.5 rounded-md border border-red-7/35 bg-red-3/25 px-3 py-1.5 text-xs font-medium text-red-11 transition-colors duration-150 hover:border-red-7/50 hover:bg-red-3/45 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-7/35 disabled:cursor-not-allowed disabled:opacity-60";
+
   return (
     <section class="space-y-6">
       <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between rounded-2xl border border-gray-6/40 bg-gray-1/40 px-3 py-2">
@@ -675,7 +687,7 @@ export default function SettingsView(props: SettingsViewProps) {
             <Show when={updateToolbarActionLabel()}>
               <Button
                 variant="outline"
-                class="text-xs h-8 py-0 px-3"
+                class="text-xs h-8 py-0 px-3 rounded-full border-gray-6/60 bg-gray-1/70 hover:bg-gray-2/70"
                 onClick={handleUpdateToolbarAction}
                 disabled={updateToolbarDisabled()}
                 title={updateState() === "ready" && props.anyActiveRuns ? "Stop active runs to update" : ""}
@@ -842,10 +854,18 @@ export default function SettingsView(props: SettingsViewProps) {
                 Enables debug tools, diagnostics, and the Developer tab.
               </div>
               <div class="pt-1 flex flex-wrap items-center gap-3">
-                <Button variant={props.developerMode ? "secondary" : "outline"} onClick={props.toggleDeveloperMode}>
-                  <Shield size={16} />
+                <button
+                  type="button"
+                  class={`${compactOutlineActionClass} ${
+                    props.developerMode
+                      ? "border-blue-7/35 bg-blue-3/20 text-blue-11 hover:bg-blue-3/35 hover:text-blue-11"
+                      : ""
+                  }`}
+                  onClick={props.toggleDeveloperMode}
+                >
+                  <Zap size={14} class={props.developerMode ? "text-blue-10" : "text-dls-secondary"} />
                   {props.developerMode ? "Disable Developer Mode" : "Enable Developer Mode"}
-                </Button>
+                </button>
                 <div class="text-xs text-gray-10">
                   {props.developerMode ? "Developer panel enabled." : "Enable this to access the Developer panel."}
                 </div>
@@ -857,23 +877,35 @@ export default function SettingsView(props: SettingsViewProps) {
               <div class="text-xs text-gray-9">{props.headerStatus}</div>
               <div class="text-xs text-gray-8 font-mono">{props.baseUrl}</div>
               <div class="pt-2 flex flex-wrap gap-2">
-                <Button
-                  variant="outline"
+                <button
+                  type="button"
+                  class={compactOutlineActionClass}
                   onClick={handleReconnectOpenworkServer}
                   disabled={props.busy || props.openworkReconnectBusy || !props.openworkServerUrl.trim()}
                 >
-                  <RefreshCcw size={14} class={props.openworkReconnectBusy ? "animate-spin" : ""} />
+                  <RefreshCcw size={14} class={`text-dls-secondary ${props.openworkReconnectBusy ? "animate-spin" : ""}`} />
                   {props.openworkReconnectBusy ? "Reconnecting..." : "Reconnect server"}
-                </Button>
+                </button>
                 <Show when={isLocalEngineRunning()}>
-                  <Button variant="danger" onClick={props.stopHost} disabled={props.busy}>
+                  <button
+                    type="button"
+                    class={compactDangerActionClass}
+                    onClick={props.stopHost}
+                    disabled={props.busy}
+                  >
+                    <CircleAlert size={14} />
                     Stop local server
-                  </Button>
+                  </button>
                 </Show>
                 <Show when={!isLocalEngineRunning() && props.openworkServerStatus === "connected"}>
-                  <Button variant="outline" onClick={props.stopHost} disabled={props.busy}>
+                  <button
+                    type="button"
+                    class={compactOutlineActionClass}
+                    onClick={props.stopHost}
+                    disabled={props.busy}
+                  >
                     Disconnect server
-                  </Button>
+                  </button>
                 </Show>
               </div>
               <Show when={openworkReconnectStatus()}>
@@ -881,6 +913,45 @@ export default function SettingsView(props: SettingsViewProps) {
               </Show>
               <Show when={openworkReconnectError()}>
                 {(value) => <div class="text-xs text-red-11">{value()}</div>}
+              </Show>
+            </div>
+
+            <div class="bg-gray-2/30 border border-gray-7/60 rounded-2xl p-5 space-y-4">
+              <div>
+                <div class="text-sm font-medium text-gray-12">{translate("settings.migration_recovery_label")}</div>
+                <div class="text-xs text-gray-9">{translate("settings.migration_recovery_hint")}</div>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="secondary"
+                  class="text-xs h-8 py-0 px-3"
+                  onClick={props.repairOpencodeMigration}
+                  disabled={props.busy || props.migrationRepairBusy || !props.migrationRepairAvailable}
+                  title={props.migrationRepairUnavailableReason ?? ""}
+                >
+                  {props.migrationRepairBusy
+                    ? translate("settings.fixing_migration")
+                    : translate("settings.fix_migration")}
+                </Button>
+              </div>
+              <Show when={props.migrationRepairUnavailableReason}>
+                {(reason) => <div class="text-xs text-amber-11">{reason()}</div>}
+              </Show>
+              <Show when={props.migrationRepairBusy}>
+                <div class="text-xs text-gray-10">{translate("status.repairing_migration")}</div>
+              </Show>
+              <Show when={props.migrationRepairResult}>
+                {(result) => (
+                  <div
+                    class={`rounded-xl border px-3 py-2 text-xs ${
+                      result().ok
+                        ? "border-green-7/30 bg-green-2/30 text-green-12"
+                        : "border-red-7/30 bg-red-2/30 text-red-12"
+                    }`}
+                  >
+                    {result().message}
+                  </div>
+                )}
               </Show>
             </div>
 
@@ -906,10 +977,10 @@ export default function SettingsView(props: SettingsViewProps) {
                             <div class="text-xs text-gray-7">OpenWork always checks on launch. Also checks once per day (quiet).</div>
                           </div>
                           <button
-                            class={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
+                            class={`min-w-[70px] px-4 py-1.5 rounded-full text-xs font-medium border shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] transition-colors ${
                               props.updateAutoCheck
-                                ? "bg-gray-12/10 text-gray-12 border-gray-6/20"
-                                : "text-gray-10 border-gray-6 hover:text-gray-12"
+                                ? "bg-gray-12/12 text-gray-12 border-gray-6/30"
+                                : "bg-gray-1/70 text-gray-10 border-gray-6/60 hover:text-gray-12 hover:bg-gray-2/70"
                             }`}
                             onClick={props.toggleUpdateAutoCheck}
                           >
@@ -923,10 +994,10 @@ export default function SettingsView(props: SettingsViewProps) {
                             <div class="text-xs text-gray-7">Download updates automatically (prompts to restart)</div>
                           </div>
                           <button
-                            class={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
+                            class={`min-w-[70px] px-4 py-1.5 rounded-full text-xs font-medium border shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] transition-colors ${
                               props.updateAutoDownload
-                                ? "bg-gray-12/10 text-gray-12 border-gray-6/20"
-                                : "text-gray-10 border-gray-6 hover:text-gray-12"
+                                ? "bg-gray-12/12 text-gray-12 border-gray-6/30"
+                                : "bg-gray-1/70 text-gray-10 border-gray-6/60 hover:text-gray-12 hover:bg-gray-2/70"
                             }`}
                             onClick={props.toggleUpdateAutoDownload}
                           >
@@ -970,7 +1041,7 @@ export default function SettingsView(props: SettingsViewProps) {
                           <div class="flex items-center gap-2">
                             <Button
                               variant="outline"
-                              class="text-xs h-8 py-0 px-3"
+                              class="text-xs h-9 py-0 px-4 rounded-full border-gray-6/60 bg-gray-1/70 hover:bg-gray-2/70"
                               onClick={props.checkForUpdates}
                               disabled={props.busy || updateState() === "checking" || updateState() === "downloading"}
                             >
@@ -980,7 +1051,7 @@ export default function SettingsView(props: SettingsViewProps) {
                             <Show when={updateState() === "available"}>
                               <Button
                                 variant="secondary"
-                                class="text-xs h-8 py-0 px-3"
+                                class="text-xs h-9 py-0 px-4 rounded-full"
                                 onClick={props.downloadUpdate}
                                 disabled={props.busy || updateState() === "downloading"}
                               >
@@ -991,7 +1062,7 @@ export default function SettingsView(props: SettingsViewProps) {
                             <Show when={updateState() === "ready"}>
                               <Button
                                 variant="secondary"
-                                class="text-xs h-8 py-0 px-3"
+                                class="text-xs h-9 py-0 px-4 rounded-full"
                                 onClick={props.installUpdateAndRestart}
                                 disabled={props.busy || props.anyActiveRuns}
                                 title={props.anyActiveRuns ? "Stop active runs to update" : ""}
@@ -1145,12 +1216,19 @@ export default function SettingsView(props: SettingsViewProps) {
                   </p>
                 </div>
 
-                <Show when={isTauriRuntime() && isLocalPreference()}>
+                <Show when={isTauriRuntime() && (isLocalPreference() || props.developerMode)}>
                   <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-5 space-y-4">
                     <div>
                       <div class="text-sm font-medium text-gray-12">Engine</div>
                       <div class="text-xs text-gray-10">Choose how OpenCode runs locally.</div>
                     </div>
+
+                    <Show when={!isLocalPreference()}>
+                      <div class="text-[11px] text-amber-11 bg-amber-3/40 border border-amber-7/40 rounded-lg px-3 py-2">
+                        Startup preference is currently remote. Engine settings are saved now and apply the next time you
+                        run locally.
+                      </div>
+                    </Show>
 
                     <div class="space-y-3">
                       <div class="text-xs text-gray-10">Engine source</div>

@@ -27,6 +27,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Circle,
   Cpu,
   HeartPulse,
   HardDrive,
@@ -224,11 +225,23 @@ const SOUL_SETUP_TEMPLATE = (() => {
   return { name, description, body };
 })();
 
-const INITIAL_MESSAGE_WINDOW = 140;
-const INITIAL_PART_WINDOW = 700;
 const MESSAGE_WINDOW_LOAD_CHUNK = 120;
 const MAX_SEARCH_MESSAGE_CHARS = 4_000;
 const MAX_SEARCH_HITS = 2_000;
+const STREAM_SCROLL_MIN_INTERVAL_MS = 90;
+const STREAM_RENDER_BATCH_MS = 220;
+const MAIN_THREAD_LAG_INTERVAL_MS = 200;
+const MAIN_THREAD_LAG_WARN_MS = 180;
+
+type CommandPaletteMode = "root" | "sessions" | "thinking";
+
+const COMMAND_PALETTE_THINKING_OPTIONS = [
+  { value: "none", label: "None", detail: "Fastest responses" },
+  { value: "low", label: "Low", detail: "Light reasoning" },
+  { value: "medium", label: "Medium", detail: "Balanced depth" },
+  { value: "high", label: "High", detail: "Deeper reasoning" },
+  { value: "xhigh", label: "X-High", detail: "Maximum effort" },
+] as const;
 
 export default function SessionView(props: SessionViewProps) {
   let messagesEndEl: HTMLDivElement | undefined;
@@ -236,6 +249,13 @@ export default function SessionView(props: SessionViewProps) {
   let agentPickerRef: HTMLDivElement | undefined;
   let sessionMenuRef: HTMLDivElement | undefined;
   let searchInputEl: HTMLInputElement | undefined;
+  let scrollFrame: number | undefined;
+  let pendingScrollBehavior: ScrollBehavior = "auto";
+  let lastAutoScrollAt = 0;
+  let streamRenderBatchTimer: number | undefined;
+  let streamRenderBatchQueuedAt = 0;
+  let streamRenderBatchReschedules = 0;
+  const topInitializedSessionIds = new Set<string>();
 
   const [toastMessage, setToastMessage] = createSignal<string | null>(null);
   const [providerAuthActionBusy, setProviderAuthActionBusy] = createSignal(false);
@@ -251,12 +271,15 @@ export default function SessionView(props: SessionViewProps) {
   const [agentPickerReady, setAgentPickerReady] = createSignal(false);
   const [agentPickerError, setAgentPickerError] = createSignal<string | null>(null);
   const [agentOptions, setAgentOptions] = createSignal<Agent[]>([]);
-  const [autoScrollEnabled, setAutoScrollEnabled] = createSignal(false);
-  const [scrollOnNextUpdate, setScrollOnNextUpdate] = createSignal(false);
+  const [nearBottom, setNearBottom] = createSignal(true);
   const [searchOpen, setSearchOpen] = createSignal(false);
   const [searchQuery, setSearchQuery] = createSignal("");
   const [searchQueryDebounced, setSearchQueryDebounced] = createSignal("");
   const [activeSearchHitIndex, setActiveSearchHitIndex] = createSignal(0);
+  const [commandPaletteOpen, setCommandPaletteOpen] = createSignal(false);
+  const [commandPaletteMode, setCommandPaletteMode] = createSignal<CommandPaletteMode>("root");
+  const [commandPaletteQuery, setCommandPaletteQuery] = createSignal("");
+  const [commandPaletteActiveIndex, setCommandPaletteActiveIndex] = createSignal(0);
   const [historyActionBusy, setHistoryActionBusy] = createSignal<"undo" | "redo" | "compact" | null>(null);
   const [messageWindowStart, setMessageWindowStart] = createSignal(0);
   const [messageWindowSessionId, setMessageWindowSessionId] = createSignal<string | null>(null);
@@ -268,6 +291,8 @@ export default function SessionView(props: SessionViewProps) {
   // When a session is selected (i.e. we are in SessionView), the right sidebar is
   // navigation-only. Avoid showing any tab as "selected" to reduce confusion.
   const showRightSidebarSelection = createMemo(() => !props.selectedSessionId);
+  let commandPaletteInputEl: HTMLInputElement | undefined;
+  const commandPaletteOptionRefs: HTMLButtonElement[] = [];
 
   const agentLabel = createMemo(() => props.selectedSessionAgent ?? "Default agent");
   const workspaceLabel = (workspace: WorkspaceInfo) =>
@@ -290,8 +315,59 @@ export default function SessionView(props: SessionViewProps) {
     todoList().filter((todo) => todo.status === "completed").length
   );
 
+  const commandPaletteSessionOptions = createMemo(() => {
+    const out: Array<{
+      workspaceId: string;
+      sessionId: string;
+      title: string;
+      workspaceTitle: string;
+      updatedAt: number;
+      searchText: string;
+    }> = [];
+
+    for (const group of props.workspaceSessionGroups) {
+      const workspaceId = group.workspace.id?.trim() ?? "";
+      if (!workspaceId) continue;
+      const workspaceTitle = workspaceLabel(group.workspace);
+      for (const session of group.sessions) {
+        const sessionId = session.id?.trim() ?? "";
+        if (!sessionId) continue;
+        const title = session.title?.trim() || "Untitled session";
+        const slug = session.slug?.trim() ?? "";
+        const updatedAt = session.time?.updated ?? session.time?.created ?? 0;
+        out.push({
+          workspaceId,
+          sessionId,
+          title,
+          workspaceTitle,
+          updatedAt,
+          searchText: [title, workspaceTitle, slug].join(" ").toLowerCase(),
+        });
+      }
+    }
+
+    out.sort((a, b) => {
+      const aActive = a.workspaceId === props.activeWorkspaceId;
+      const bActive = b.workspaceId === props.activeWorkspaceId;
+      if (aActive !== bActive) return aActive ? -1 : 1;
+      return b.updatedAt - a.updatedAt;
+    });
+
+    return out;
+  });
+
+  const totalSessionCount = createMemo(() => commandPaletteSessionOptions().length);
+
   type SearchHit = {
     messageId: string;
+  };
+
+  type CommandPaletteItem = {
+    id: string;
+    title: string;
+    detail?: string;
+    meta?: string;
+    action: () => void;
   };
 
   const messageIdFromInfo = (message: MessageWithParts) => {
@@ -421,26 +497,6 @@ export default function SessionView(props: SessionViewProps) {
   const searchActive = createMemo(() => searchOpen() && searchQuery().trim().length > 0);
   const totalPartCount = createMemo(() => props.messages.reduce((total, message) => total + message.parts.length, 0));
 
-  const computeWindowStart = (messages: MessageWithParts[]) => {
-    const total = messages.length;
-    if (!total) return 0;
-
-    let count = 0;
-    let parts = 0;
-
-    for (let index = total - 1; index >= 0; index -= 1) {
-      const nextCount = count + 1;
-      const nextParts = parts + (messages[index]?.parts.length ?? 0);
-      if (nextCount > INITIAL_MESSAGE_WINDOW || nextParts > INITIAL_PART_WINDOW) {
-        return Math.min(total - 1, index + 1);
-      }
-      count = nextCount;
-      parts = nextParts;
-    }
-
-    return 0;
-  };
-
   const renderedMessages = createMemo(() => {
     if (messageWindowExpanded() || searchActive()) return props.messages;
 
@@ -448,6 +504,91 @@ export default function SessionView(props: SessionViewProps) {
     if (start <= 0) return props.messages;
     if (start >= props.messages.length) return [];
     return props.messages.slice(start);
+  });
+
+  const [batchedRenderedMessages, setBatchedRenderedMessages] = createSignal<MessageWithParts[]>(renderedMessages());
+
+  createEffect(() => {
+    const next = renderedMessages();
+    const sourceMessageCount = props.messages.length;
+    const sourcePartCount = totalPartCount();
+    if (props.sessionStatus === "idle") {
+      if (streamRenderBatchTimer !== undefined) {
+        window.clearTimeout(streamRenderBatchTimer);
+        streamRenderBatchTimer = undefined;
+      }
+      setBatchedRenderedMessages(next);
+      streamRenderBatchQueuedAt = 0;
+      streamRenderBatchReschedules = 0;
+      return;
+    }
+
+    if (streamRenderBatchQueuedAt <= 0) {
+      streamRenderBatchQueuedAt = perfNow();
+    } else {
+      streamRenderBatchReschedules += 1;
+    }
+
+    if (streamRenderBatchTimer !== undefined) {
+      window.clearTimeout(streamRenderBatchTimer);
+      streamRenderBatchTimer = undefined;
+    }
+
+    streamRenderBatchTimer = window.setTimeout(() => {
+      const applyStartedAt = perfNow();
+      setBatchedRenderedMessages(next);
+      streamRenderBatchTimer = undefined;
+      const applyMs = Math.round((perfNow() - applyStartedAt) * 100) / 100;
+      const queuedMs = streamRenderBatchQueuedAt > 0 ? Math.round((perfNow() - streamRenderBatchQueuedAt) * 100) / 100 : 0;
+      const reschedules = streamRenderBatchReschedules;
+      streamRenderBatchQueuedAt = 0;
+      streamRenderBatchReschedules = 0;
+
+      if (props.developerMode) {
+        window.requestAnimationFrame(() => {
+          const paintMs = Math.round((perfNow() - applyStartedAt) * 100) / 100;
+          if (queuedMs >= 180 || applyMs >= 8 || paintMs >= 24 || reschedules >= 3) {
+            recordPerfLog(true, "session.render", "batch-commit", {
+              queuedMs,
+              applyMs,
+              paintMs,
+              reschedules,
+              sessionID: props.selectedSessionId,
+              status: props.sessionStatus,
+              sourceMessageCount,
+              sourcePartCount,
+              renderedMessageCount: next.length,
+            });
+          }
+        });
+      }
+    }, STREAM_RENDER_BATCH_MS);
+  });
+
+  createEffect(() => {
+    if (!props.developerMode) return;
+    if (typeof window === "undefined") return;
+
+    let expectedAt = perfNow() + MAIN_THREAD_LAG_INTERVAL_MS;
+    const interval = window.setInterval(() => {
+      const now = perfNow();
+      const lagMs = Math.round((now - expectedAt) * 100) / 100;
+      expectedAt = now + MAIN_THREAD_LAG_INTERVAL_MS;
+      if (lagMs < MAIN_THREAD_LAG_WARN_MS) return;
+
+      recordPerfLog(true, "session.main-thread", "lag", {
+        lagMs,
+        sessionID: props.selectedSessionId,
+        status: props.sessionStatus,
+        messageCount: props.messages.length,
+        partCount: totalPartCount(),
+        renderedMessageCount: batchedRenderedMessages().length,
+      });
+    }, MAIN_THREAD_LAG_INTERVAL_MS);
+
+    onCleanup(() => {
+      window.clearInterval(interval);
+    });
   });
 
   const hiddenMessageCount = createMemo(() => {
@@ -748,36 +889,45 @@ export default function SessionView(props: SessionViewProps) {
     messagesEndEl?.scrollIntoView({ behavior, block: "end" });
   };
 
+  const scheduleScrollToLatest = (behavior: ScrollBehavior = "auto") => {
+    if (behavior === "smooth") {
+      pendingScrollBehavior = "smooth";
+    }
+    if (scrollFrame !== undefined) return;
+    scrollFrame = window.requestAnimationFrame(() => {
+      scrollFrame = undefined;
+      const nextBehavior = pendingScrollBehavior;
+      pendingScrollBehavior = "auto";
+      const now = Date.now();
+      if (nextBehavior === "auto" && now - lastAutoScrollAt < STREAM_SCROLL_MIN_INTERVAL_MS) {
+        return;
+      }
+      lastAutoScrollAt = now;
+      scrollToLatest(nextBehavior);
+    });
+  };
+
+  onCleanup(() => {
+    if (scrollFrame !== undefined) {
+      window.cancelAnimationFrame(scrollFrame);
+      scrollFrame = undefined;
+    }
+    if (streamRenderBatchTimer !== undefined) {
+      window.clearTimeout(streamRenderBatchTimer);
+      streamRenderBatchTimer = undefined;
+    }
+    streamRenderBatchQueuedAt = 0;
+    streamRenderBatchReschedules = 0;
+  });
+
   createEffect(
     on(
-      () => [props.selectedSessionId, props.messages.length, totalPartCount()] as const,
-      ([sessionId, count], previous) => {
-        const previousSessionId = previous?.[0] ?? null;
+      () => props.selectedSessionId,
+      (sessionId, previousSessionId) => {
         if (sessionId !== previousSessionId) {
-          setMessageWindowSessionId(null);
+          setMessageWindowSessionId(sessionId ?? null);
           setMessageWindowExpanded(false);
           setMessageWindowStart(0);
-        }
-
-        if (!sessionId) return;
-        if (messageWindowExpanded()) return;
-        if (count === 0) return;
-
-        const targetStart = computeWindowStart(props.messages);
-        if (messageWindowSessionId() !== sessionId) {
-          setMessageWindowStart(targetStart);
-          setMessageWindowSessionId(sessionId);
-          return;
-        }
-
-        const currentStart = messageWindowStart();
-        if (currentStart <= 0 && targetStart > 0) {
-          setMessageWindowStart(targetStart);
-          return;
-        }
-
-        if (autoScrollEnabled() && targetStart > currentStart) {
-          setMessageWindowStart(targetStart);
         }
       },
       { defer: true },
@@ -902,7 +1052,7 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   const runPhase = createMemo(() => {
-    if (props.error) return "error";
+    if (props.error && (runStartedAt() !== null || runHasBegun())) return "error";
     const status = props.sessionStatus;
     const started = runStartedAt() !== null;
     if (status === "idle") {
@@ -1015,6 +1165,17 @@ export default function SessionView(props: SessionViewProps) {
     return `${trimmed.slice(0, max)}...`;
   };
 
+  const formatRunErrorDetail = (message: string) => {
+    const lines = message
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) return "Run failed";
+    const compact = lines.slice(0, 4).join("\n");
+    if (lines.length <= 4) return compact;
+    return `${compact}\n...`;
+  };
+
   const thinkingStatus = createMemo(() => {
     const status = computeStatusFromPart(latestRunPart());
     if (status) return status;
@@ -1023,6 +1184,12 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   const thinkingDetail = createMemo<null | { title: string; detail?: string }>(() => {
+    if (runPhase() === "error") {
+      if (!props.error) return { title: "Error" };
+      const detail = truncateDetail(formatRunErrorDetail(props.error), 420);
+      return detail ? { title: "Error", detail } : { title: "Error" };
+    }
+
     const reasoning = latestRunReasoning();
     if (reasoning) {
       const detail = truncateDetail(reasoning);
@@ -1082,10 +1249,14 @@ export default function SessionView(props: SessionViewProps) {
     setTimeout(() => setIsInitialLoad(false), 2000);
   });
 
+  const jumpToLatest = (behavior: ScrollBehavior = "smooth") => {
+    scheduleScrollToLatest(behavior);
+  };
+
   onMount(() => {
     const container = chatContainerEl;
     if (!container) return;
-    const update = () => setAutoScrollEnabled(isNearBottom(container));
+    const update = () => setNearBottom(isNearBottom(container));
     update();
     container.addEventListener("scroll", update, { passive: true });
     onCleanup(() => container.removeEventListener("scroll", update));
@@ -1094,11 +1265,31 @@ export default function SessionView(props: SessionViewProps) {
   createEffect(
     on(
       () => props.selectedSessionId,
-      () => {
+      (sessionId) => {
         setSearchOpen(false);
         setSearchQuery("");
         setSearchQueryDebounced("");
         setActiveSearchHitIndex(0);
+
+        if (!sessionId) return;
+        const firstVisit = !topInitializedSessionIds.has(sessionId);
+        topInitializedSessionIds.add(sessionId);
+
+        if (!firstVisit) {
+          queueMicrotask(() => {
+            const container = chatContainerEl;
+            if (!container) return;
+            setNearBottom(isNearBottom(container));
+          });
+          return;
+        }
+
+        queueMicrotask(() => {
+          const container = chatContainerEl;
+          if (!container) return;
+          container.scrollTop = 0;
+          setNearBottom(isNearBottom(container));
+        });
       },
     ),
   );
@@ -1127,8 +1318,72 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   createEffect(() => {
+    if (!commandPaletteOpen()) return;
+    focusCommandPaletteInput();
+  });
+
+  createEffect(() => {
+    if (!commandPaletteOpen()) return;
+    const total = commandPaletteItems().length;
+    if (total === 0) {
+      setCommandPaletteActiveIndex(0);
+      return;
+    }
+    setCommandPaletteActiveIndex((current) => Math.max(0, Math.min(current, total - 1)));
+  });
+
+  createEffect(() => {
+    if (!commandPaletteOpen()) return;
+    const idx = commandPaletteActiveIndex();
+    requestAnimationFrame(() => {
+      commandPaletteOptionRefs[idx]?.scrollIntoView({ block: "nearest" });
+    });
+  });
+
+  createEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const mod = event.metaKey || event.ctrlKey;
+      if (mod && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (commandPaletteOpen()) {
+          closeCommandPalette();
+        } else {
+          openCommandPalette();
+        }
+        return;
+      }
+
+      if (commandPaletteOpen()) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeCommandPalette();
+          return;
+        }
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          stepCommandPaletteIndex(1, commandPaletteItems().length);
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          stepCommandPaletteIndex(-1, commandPaletteItems().length);
+          return;
+        }
+        if (event.key === "Enter") {
+          if (event.isComposing || event.keyCode === 229) return;
+          const item = commandPaletteItems()[commandPaletteActiveIndex()];
+          if (!item) return;
+          event.preventDefault();
+          item.action();
+          return;
+        }
+        if (event.key === "Backspace" && !commandPaletteQuery().trim() && commandPaletteMode() !== "root") {
+          event.preventDefault();
+          returnToCommandRoot();
+        }
+        return;
+      }
+
       if (mod && !event.altKey && event.key.toLowerCase() === "f") {
         event.preventDefault();
         openSearch();
@@ -1166,7 +1421,7 @@ export default function SessionView(props: SessionViewProps) {
 
   createEffect(() => {
     if (!runStartedAt()) return;
-    if (props.sessionStatus === "idle" && runHasBegun() && !props.error) {
+    if (props.sessionStatus === "idle" && runHasBegun()) {
       setRunStartedAt(null);
       setRunHasBegun(false);
       setRunLastProgressAt(null);
@@ -1195,13 +1450,6 @@ export default function SessionView(props: SessionViewProps) {
         if (mLen > prevM || tLen > prevT || pCount > prevP) {
           if (showRunIndicator()) {
             setRunLastProgressAt(Date.now());
-          }
-          const shouldScroll = scrollOnNextUpdate() || autoScrollEnabled();
-          if (shouldScroll) {
-            scrollToLatest(scrollOnNextUpdate() ? "smooth" : "auto");
-          }
-          if (scrollOnNextUpdate()) {
-            setScrollOnNextUpdate(false);
           }
         }
       },
@@ -1241,6 +1489,44 @@ export default function SessionView(props: SessionViewProps) {
     if (ms >= hardMs) return "hard";
     if (ms >= softMs) return "soft";
     return "none";
+  });
+
+  let lastStallPerfStage: "none" | "soft" | "hard" = "none";
+  createEffect(() => {
+    if (!props.developerMode) {
+      lastStallPerfStage = "none";
+      return;
+    }
+
+    const stage = stallStage();
+    if (stage === lastStallPerfStage) return;
+
+    const previous = lastStallPerfStage;
+    lastStallPerfStage = stage;
+
+    if (stage === "none") {
+      if (previous !== "none") {
+        recordPerfLog(true, "session.run", "stall-recovered", {
+          sessionID: props.selectedSessionId,
+          phase: runPhase(),
+          elapsedMs: runElapsedMs(),
+          messageCount: props.messages.length,
+          partCount: totalPartCount(),
+        });
+      }
+      return;
+    }
+
+    recordPerfLog(true, "session.run", stage === "soft" ? "stall-soft" : "stall-hard", {
+      sessionID: props.selectedSessionId,
+      phase: runPhase(),
+      stallMs: runStallMs(),
+      elapsedMs: runElapsedMs(),
+      messageCount: props.messages.length,
+      renderedMessageCount: renderedMessages().length,
+      hiddenMessageCount: hiddenMessageCount(),
+      partCount: totalPartCount(),
+    });
   });
 
   const cancelRun = async () => {
@@ -1291,6 +1577,47 @@ export default function SessionView(props: SessionViewProps) {
       searchInputEl?.focus();
       searchInputEl?.select();
     });
+  };
+
+  const focusCommandPaletteInput = () => {
+    queueMicrotask(() => {
+      commandPaletteInputEl?.focus();
+      commandPaletteInputEl?.select();
+    });
+  };
+
+  const openCommandPalette = (mode: CommandPaletteMode = "root") => {
+    setCommandPaletteMode(mode);
+    setCommandPaletteQuery("");
+    setCommandPaletteActiveIndex(0);
+    setCommandPaletteOpen(true);
+    focusCommandPaletteInput();
+  };
+
+  const closeCommandPalette = () => {
+    setCommandPaletteOpen(false);
+    setCommandPaletteMode("root");
+    setCommandPaletteQuery("");
+    setCommandPaletteActiveIndex(0);
+  };
+
+  const stepCommandPaletteIndex = (delta: number, total: number) => {
+    if (total <= 0) {
+      setCommandPaletteActiveIndex(0);
+      return;
+    }
+    setCommandPaletteActiveIndex((current) => {
+      const normalized = ((current % total) + total) % total;
+      return (normalized + delta + total) % total;
+    });
+  };
+
+  const returnToCommandRoot = () => {
+    if (commandPaletteMode() === "root") return;
+    setCommandPaletteMode("root");
+    setCommandPaletteQuery("");
+    setCommandPaletteActiveIndex(0);
+    focusCommandPaletteInput();
   };
 
   const openSearch = () => {
@@ -1760,8 +2087,6 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   const handleSendPrompt = (draft: ComposerDraft) => {
-    setScrollOnNextUpdate(true);
-    scrollToLatest("auto");
     startRun();
     props.sendPromptAsync(draft).catch(() => undefined);
   };
@@ -1798,15 +2123,16 @@ export default function SessionView(props: SessionViewProps) {
 
   const handleSoulQuickstart = async () => {
     const name = SOUL_SETUP_TEMPLATE.name;
+    const slashCommand = `/${name}`;
     try {
       const commands = await props.listCommands();
       const hasCommand = commands.some((cmd) => cmd.name === name);
       if (hasCommand) {
         handleSendPrompt({
           mode: "prompt",
-          text: `/${name}`,
-          resolvedText: `/${name}`,
-          parts: [{ type: "text", text: `/${name}` }],
+          text: slashCommand,
+          resolvedText: slashCommand,
+          parts: [{ type: "text", text: slashCommand }],
           attachments: [],
           command: { name, arguments: "" },
         });
@@ -1901,6 +2227,123 @@ export default function SessionView(props: SessionViewProps) {
     })();
   };
 
+  const commandPaletteRootItems = createMemo<CommandPaletteItem[]>(() => {
+    const items: CommandPaletteItem[] = [
+      {
+        id: "sessions",
+        title: "Search sessions",
+        detail: `${totalSessionCount().toLocaleString()} available across workers`,
+        meta: "Jump",
+        action: () => {
+          setCommandPaletteMode("sessions");
+          setCommandPaletteQuery("");
+          setCommandPaletteActiveIndex(0);
+          focusCommandPaletteInput();
+        },
+      },
+      {
+        id: "model",
+        title: "Change model",
+        detail: `Current: ${props.selectedSessionModelLabel || "Model"}`,
+        meta: "Open",
+        action: () => {
+          closeCommandPalette();
+          props.openSessionModelPicker();
+        },
+      },
+      {
+        id: "thinking",
+        title: "Change thinking",
+        detail: `Current: ${props.modelVariantLabel}`,
+        meta: "Adjust",
+        action: () => {
+          setCommandPaletteMode("thinking");
+          setCommandPaletteQuery("");
+          setCommandPaletteActiveIndex(0);
+          focusCommandPaletteInput();
+        },
+      },
+    ];
+
+    const query = commandPaletteQuery().trim().toLowerCase();
+    if (!query) return items;
+    return items.filter((item) => `${item.title} ${item.detail ?? ""}`.toLowerCase().includes(query));
+  });
+
+  const commandPaletteSessionItems = createMemo<CommandPaletteItem[]>(() => {
+    const query = commandPaletteQuery().trim().toLowerCase();
+    const candidates = query
+      ? commandPaletteSessionOptions().filter((item) => item.searchText.includes(query))
+      : commandPaletteSessionOptions();
+
+    return candidates.slice(0, 80).map((item) => ({
+      id: `session:${item.workspaceId}:${item.sessionId}`,
+      title: item.title,
+      detail: item.workspaceTitle,
+      meta: item.workspaceId === props.activeWorkspaceId ? "Current worker" : "Switch",
+      action: () => {
+        closeCommandPalette();
+        openSessionFromList(item.workspaceId, item.sessionId);
+      },
+    }));
+  });
+
+  const commandPaletteThinkingItems = createMemo<CommandPaletteItem[]>(() => {
+    const normalizedRaw = (props.modelVariant ?? "none").trim().toLowerCase();
+    const activeVariant =
+      normalizedRaw === "balanced" || normalizedRaw === "balance" ? "none" : normalizedRaw;
+    const query = commandPaletteQuery().trim().toLowerCase();
+
+    return COMMAND_PALETTE_THINKING_OPTIONS
+      .filter((option) => {
+        if (!query) return true;
+        return `${option.label} ${option.detail}`.toLowerCase().includes(query);
+      })
+      .map((option) => ({
+        id: `thinking:${option.value}`,
+        title: option.label,
+        detail: option.detail,
+        meta: activeVariant === option.value ? "Current" : undefined,
+        action: () => {
+          props.setModelVariant(option.value);
+          closeCommandPalette();
+          setToastMessage(`Thinking set to ${option.label}.`);
+        },
+      }));
+  });
+
+  const commandPaletteItems = createMemo<CommandPaletteItem[]>(() => {
+    const mode = commandPaletteMode();
+    if (mode === "sessions") return commandPaletteSessionItems();
+    if (mode === "thinking") return commandPaletteThinkingItems();
+    return commandPaletteRootItems();
+  });
+
+  const commandPaletteTitle = createMemo(() => {
+    const mode = commandPaletteMode();
+    if (mode === "sessions") return "Search sessions";
+    if (mode === "thinking") return "Change thinking";
+    return "Quick actions";
+  });
+
+  const commandPalettePlaceholder = createMemo(() => {
+    const mode = commandPaletteMode();
+    if (mode === "sessions") return "Find by session title or worker";
+    if (mode === "thinking") return "Filter thinking options";
+    return "Search actions";
+  });
+
+  createEffect(
+    on(
+      () => [commandPaletteMode(), commandPaletteQuery()],
+      () => {
+        if (!commandPaletteOpen()) return;
+        commandPaletteOptionRefs.length = 0;
+        setCommandPaletteActiveIndex(0);
+      },
+    ),
+  );
+
   const openSettings = (tab: SettingsTab = "general") => {
     props.setSettingsTab(tab);
     props.setTab("settings");
@@ -1938,12 +2381,50 @@ export default function SessionView(props: SessionViewProps) {
     return "Update available";
   });
 
-  const updatePillTone = createMemo(() => {
+  const updatePillButtonTone = createMemo(() => {
     const state = props.updateStatus?.state;
     if (state === "ready") {
-      return "border-transparent bg-green-9 text-white shadow-[0_2px_10px_rgba(22,163,74,0.35)] hover:bg-green-10";
+      return props.anyActiveRuns
+        ? "text-amber-11 hover:text-amber-11 hover:bg-amber-3/30"
+        : "text-green-11 hover:text-green-11 hover:bg-green-3/30";
     }
-    return "border-transparent bg-dls-accent text-white shadow-[0_2px_10px_rgba(var(--dls-accent-rgb),0.35)] hover:bg-[var(--dls-accent-hover)]";
+    if (state === "downloading") {
+      return "text-blue-11 hover:text-blue-11 hover:bg-blue-3/30";
+    }
+    return "text-dls-secondary hover:text-emerald-11 hover:bg-emerald-3/25";
+  });
+
+  const updatePillBorderTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return props.anyActiveRuns ? "border-amber-7/35" : "border-green-7/35";
+    }
+    if (state === "downloading") {
+      return "border-blue-7/35";
+    }
+    return "border-dls-border";
+  });
+
+  const updatePillDotTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return props.anyActiveRuns ? "text-amber-10 fill-amber-10" : "text-green-10 fill-green-10";
+    }
+    if (state === "downloading") {
+      return "text-blue-10";
+    }
+    return "text-emerald-10 fill-emerald-10";
+  });
+
+  const updatePillVersionTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return props.anyActiveRuns ? "text-amber-11/75" : "text-green-11/75";
+    }
+    if (state === "downloading") {
+      return "text-blue-11/75";
+    }
+    return "text-dls-secondary";
   });
 
   const updatePillTitle = createMemo(() => {
@@ -2004,7 +2485,7 @@ export default function SessionView(props: SessionViewProps) {
           <Show when={showUpdatePill()}>
             <button
               type="button"
-              class={`mb-3 w-full flex h-9 items-center gap-2 rounded-xl border px-3 text-xs font-medium transition-all hover:-translate-y-[1px] ${updatePillTone()}`}
+              class={`group mb-3 w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--dls-accent-rgb),0.2)] ${updatePillButtonTone()}`}
               onClick={handleUpdatePillClick}
               title={updatePillTitle()}
               aria-label={updatePillTitle()}
@@ -2012,15 +2493,18 @@ export default function SessionView(props: SessionViewProps) {
               <Show
                 when={props.updateStatus?.state === "downloading"}
                 fallback={
-                  <span class="w-2 h-2 rounded-full bg-white/85" />
+                  <Circle
+                    size={8}
+                    class={`${updatePillDotTone()} shrink-0 ${props.updateStatus?.state === "available" ? "group-hover:animate-pulse" : ""}`}
+                  />
                 }
               >
-                <Loader2 size={14} class="animate-spin text-white/90" />
+                <Loader2 size={13} class={`animate-spin shrink-0 ${updatePillDotTone()}`} />
               </Show>
-              <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
+              <span class="flex-1 text-left">{updatePillLabel()}</span>
               <Show when={props.updateStatus?.version}>
                 {(version) => (
-                  <span class="ml-auto text-[11px] text-white/80 font-mono">v{version()}</span>
+                  <span class={`ml-auto font-mono text-[10px] ${updatePillVersionTone()}`}>v{version()}</span>
                 )}
               </Show>
             </button>
@@ -2389,7 +2873,7 @@ export default function SessionView(props: SessionViewProps) {
             <Show when={showUpdatePill()}>
               <button
                 type="button"
-                class={`md:hidden flex h-8 items-center gap-2 rounded-full border px-3 text-xs font-medium transition-colors ${updatePillTone()}`}
+                class={`md:hidden flex items-center gap-1.5 rounded-full border bg-dls-surface px-2.5 py-1 text-xs font-medium shadow-sm transition-colors active:scale-[0.99] focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--dls-accent-rgb),0.2)] ${updatePillBorderTone()} ${updatePillButtonTone()}`}
                 onClick={handleUpdatePillClick}
                 title={updatePillTitle()}
                 aria-label={updatePillTitle()}
@@ -2397,15 +2881,18 @@ export default function SessionView(props: SessionViewProps) {
                 <Show
                   when={props.updateStatus?.state === "downloading"}
                   fallback={
-                    <span class="w-2 h-2 rounded-full bg-white/85" />
+                    <Circle
+                      size={8}
+                      class={`${updatePillDotTone()} shrink-0 ${props.updateStatus?.state === "available" ? "animate-pulse" : ""}`}
+                    />
                   }
                 >
-                  <Loader2 size={14} class="animate-spin text-white/90" />
+                  <Loader2 size={13} class={`animate-spin shrink-0 ${updatePillDotTone()}`} />
                 </Show>
-                <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
+                <span class="text-[11px]">{updatePillLabel()}</span>
                 <Show when={props.updateStatus?.version}>
                   {(version) => (
-                    <span class="hidden sm:inline text-[11px] text-white/80 font-mono">v{version()}</span>
+                    <span class={`hidden sm:inline font-mono text-[10px] ${updatePillVersionTone()}`}>v{version()}</span>
                   )}
                 </Show>
               </button>
@@ -2421,6 +2908,27 @@ export default function SessionView(props: SessionViewProps) {
           </div>
 
           <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class={`h-9 px-2.5 flex items-center justify-center rounded-lg text-[11px] font-mono transition-colors ${
+                commandPaletteOpen()
+                  ? "bg-dls-active text-dls-text"
+                  : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
+              }`}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (commandPaletteOpen()) {
+                  closeCommandPalette();
+                  return;
+                }
+                window.setTimeout(() => openCommandPalette(), 0);
+              }}
+              title="Quick actions (Ctrl/Cmd+K)"
+              aria-label="Quick actions"
+            >
+              Cmd+K
+            </button>
             <button
               type="button"
               class={`h-9 w-9 flex items-center justify-center rounded-lg transition-colors ${
@@ -2586,14 +3094,6 @@ export default function SessionView(props: SessionViewProps) {
           </div>
         </Show>
 
-      <Show when={props.error}>
-        <div class="mx-auto max-w-5xl w-full px-6 md:px-10 pt-4">
-          <div class="rounded-2xl bg-red-1/40 px-5 py-4 text-sm text-red-12 border border-red-7/20">
-            {props.error}
-          </div>
-        </div>
-      </Show>
-
        <div class="flex-1 flex overflow-hidden">
          <div class="flex-1 min-w-0 relative overflow-hidden">
            <div
@@ -2636,6 +3136,7 @@ export default function SessionView(props: SessionViewProps) {
                   <div class="mt-1 text-xs text-dls-secondary leading-relaxed">
                     Keep your goals and preferences across sessions with light scheduled check-ins.
                     Tradeoff: more autonomy can create extra background runs, but revert is one command.
+                    Audit setup and heartbeat evidence from the Soul section.
                   </div>
                 </button>
               </div>
@@ -2656,7 +3157,8 @@ export default function SessionView(props: SessionViewProps) {
           </Show>
 
           <MessageList
-            messages={renderedMessages()}
+            messages={batchedRenderedMessages()}
+            isStreaming={showRunIndicator()}
             developerMode={props.developerMode}
             showThinking={props.showThinking}
             workspaceRoot={props.activeWorkspaceRoot}
@@ -2700,17 +3202,19 @@ export default function SessionView(props: SessionViewProps) {
            </div>
            </div>
 
-           <Show when={!autoScrollEnabled() && props.messages.length > 0}>
-             <div class="absolute bottom-4 left-0 right-0 z-20 flex justify-center pointer-events-none">
-               <button
-                 type="button"
-                 class="pointer-events-auto rounded-full border border-gray-6 bg-gray-1/90 px-4 py-2 text-xs text-gray-11 shadow-lg shadow-gray-12/5 backdrop-blur-md hover:bg-gray-2 transition-colors"
-                 onClick={() => scrollToLatest("smooth")}
-               >
-                 Jump to latest
-               </button>
-             </div>
-           </Show>
+            <Show when={props.messages.length > 0 && !nearBottom()}>
+              <div class="absolute bottom-4 left-0 right-0 z-20 flex justify-center pointer-events-none">
+                <div class="pointer-events-auto flex items-center gap-2 rounded-full border border-gray-6 bg-gray-1/90 p-1 shadow-lg shadow-gray-12/5 backdrop-blur-md">
+                  <button
+                    type="button"
+                    class="rounded-full px-3 py-1.5 text-xs text-gray-11 hover:bg-gray-2 transition-colors"
+                    onClick={() => jumpToLatest("smooth")}
+                  >
+                    Jump to latest
+                  </button>
+                </div>
+              </div>
+            </Show>
          </div>
 
           <Show when={markdownEditorOpen()}>
@@ -2793,6 +3297,7 @@ export default function SessionView(props: SessionViewProps) {
 
       <Composer
         prompt={props.prompt}
+        developerMode={props.developerMode}
         busy={props.busy}
         isStreaming={showRunIndicator()}
         onSend={handleSendPrompt}
@@ -2951,6 +3456,100 @@ export default function SessionView(props: SessionViewProps) {
           />
         </div>
       </aside>
+
+      <Show when={commandPaletteOpen()}>
+        <div
+          class="fixed inset-0 z-50 bg-gray-1/60 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto"
+          onClick={closeCommandPalette}
+        >
+          <div
+            class="w-full max-w-2xl mt-12 rounded-2xl border border-dls-border bg-dls-surface shadow-2xl overflow-hidden"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="border-b border-dls-border px-4 py-3 space-y-2">
+              <div class="flex items-center gap-2">
+                <Show when={commandPaletteMode() !== "root"}>
+                  <button
+                    type="button"
+                    class="h-8 px-2 rounded-md text-xs text-dls-secondary hover:text-dls-text hover:bg-dls-hover transition-colors"
+                    onClick={returnToCommandRoot}
+                  >
+                    Back
+                  </button>
+                </Show>
+                <Search size={14} class="text-dls-secondary shrink-0" />
+                <input
+                  ref={(el) => (commandPaletteInputEl = el)}
+                  type="text"
+                  value={commandPaletteQuery()}
+                  onInput={(event) => setCommandPaletteQuery(event.currentTarget.value)}
+                  placeholder={commandPalettePlaceholder()}
+                  class="min-w-0 flex-1 bg-transparent text-sm text-dls-text placeholder:text-dls-secondary focus:outline-none"
+                  aria-label={commandPaletteTitle()}
+                />
+                <button
+                  type="button"
+                  class="h-8 w-8 flex items-center justify-center rounded-md text-dls-secondary hover:text-dls-text hover:bg-dls-hover transition-colors"
+                  onClick={closeCommandPalette}
+                  aria-label="Close quick actions"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+              <div class="text-[11px] text-dls-secondary">{commandPaletteTitle()}</div>
+            </div>
+
+            <div class="max-h-[56vh] overflow-y-auto p-2">
+              <Show
+                when={commandPaletteItems().length > 0}
+                fallback={
+                  <div class="px-3 py-6 text-sm text-dls-secondary text-center">
+                    No matches.
+                  </div>
+                }
+              >
+                <For each={commandPaletteItems()}>
+                  {(item, index) => {
+                    const idx = () => index();
+                    return (
+                      <button
+                        ref={(el) => {
+                          commandPaletteOptionRefs[idx()] = el;
+                        }}
+                        type="button"
+                        class={`w-full text-left rounded-xl px-3 py-2.5 transition-colors ${
+                          idx() === commandPaletteActiveIndex()
+                            ? "bg-dls-active text-dls-text"
+                            : "text-dls-text hover:bg-dls-hover"
+                        }`}
+                        onMouseEnter={() => setCommandPaletteActiveIndex(idx())}
+                        onClick={item.action}
+                      >
+                        <div class="flex items-start justify-between gap-3">
+                          <div class="min-w-0">
+                            <div class="text-sm font-medium truncate">{item.title}</div>
+                            <Show when={item.detail}>
+                              <div class="text-xs text-dls-secondary mt-1 truncate">{item.detail}</div>
+                            </Show>
+                          </div>
+                          <Show when={item.meta}>
+                            <span class="text-[10px] uppercase tracking-wide text-dls-secondary shrink-0">{item.meta}</span>
+                          </Show>
+                        </div>
+                      </button>
+                    );
+                  }}
+                </For>
+              </Show>
+            </div>
+
+            <div class="border-t border-dls-border px-3 py-2 text-[11px] text-dls-secondary flex items-center justify-between gap-2">
+              <span>Arrow keys to navigate</span>
+              <span>Enter to run · Esc to close</span>
+            </div>
+          </div>
+        </div>
+      </Show>
 
       <ProviderAuthModal
         open={props.providerAuthModalOpen}

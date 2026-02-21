@@ -49,6 +49,7 @@ import {
   Box,
   ChevronDown,
   ChevronRight,
+  Circle,
   History,
   HeartPulse,
   Loader2,
@@ -137,6 +138,7 @@ export type DashboardViewProps = {
   scheduledJobs: ScheduledJob[];
   scheduledJobsSource: "local" | "remote";
   scheduledJobsSourceReady: boolean;
+  schedulerPluginInstalled: boolean;
   scheduledJobsStatus: string | null;
   scheduledJobsBusy: boolean;
   scheduledJobsUpdatedAt: number | null;
@@ -265,6 +267,11 @@ export type DashboardViewProps = {
   workspaceDebugEvents: unknown;
   clearWorkspaceDebugEvents: () => void;
   safeStringify: (value: unknown) => string;
+  repairOpencodeMigration: () => void;
+  migrationRepairBusy: boolean;
+  migrationRepairResult: { ok: boolean; message: string } | null;
+  migrationRepairAvailable: boolean;
+  migrationRepairUnavailableReason: string | null;
   repairOpencodeCache: () => void;
   cacheRepairBusy: boolean;
   cacheRepairResult: string | null;
@@ -749,12 +756,50 @@ export default function DashboardView(props: DashboardViewProps) {
     return "Update available";
   });
 
-  const updatePillTone = createMemo(() => {
+  const updatePillButtonTone = createMemo(() => {
     const state = props.updateStatus?.state;
     if (state === "ready") {
-      return "border-transparent bg-green-9 text-white shadow-[0_2px_10px_rgba(22,163,74,0.35)] hover:bg-green-10";
+      return props.anyActiveRuns
+        ? "text-amber-11 hover:text-amber-11 hover:bg-amber-3/30"
+        : "text-green-11 hover:text-green-11 hover:bg-green-3/30";
     }
-    return "border-transparent bg-dls-accent text-white shadow-[0_2px_10px_rgba(var(--dls-accent-rgb),0.35)] hover:bg-[var(--dls-accent-hover)]";
+    if (state === "downloading") {
+      return "text-blue-11 hover:text-blue-11 hover:bg-blue-3/30";
+    }
+    return "text-dls-secondary hover:text-emerald-11 hover:bg-emerald-3/25";
+  });
+
+  const updatePillBorderTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return props.anyActiveRuns ? "border-amber-7/35" : "border-green-7/35";
+    }
+    if (state === "downloading") {
+      return "border-blue-7/35";
+    }
+    return "border-dls-border";
+  });
+
+  const updatePillDotTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return props.anyActiveRuns ? "text-amber-10 fill-amber-10" : "text-green-10 fill-green-10";
+    }
+    if (state === "downloading") {
+      return "text-blue-10";
+    }
+    return "text-emerald-10 fill-emerald-10";
+  });
+
+  const updatePillVersionTone = createMemo(() => {
+    const state = props.updateStatus?.state;
+    if (state === "ready") {
+      return props.anyActiveRuns ? "text-amber-11/75" : "text-green-11/75";
+    }
+    if (state === "downloading") {
+      return "text-blue-11/75";
+    }
+    return "text-dls-secondary";
   });
 
   const updatePillTitle = createMemo(() => {
@@ -785,7 +830,7 @@ export default function DashboardView(props: DashboardViewProps) {
           <Show when={showUpdatePill()}>
             <button
               type="button"
-              class={`mb-3 w-full flex h-9 items-center gap-2 rounded-xl border px-3 text-xs font-medium transition-all hover:-translate-y-[1px] ${updatePillTone()}`}
+              class={`group mb-3 w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--dls-accent-rgb),0.2)] ${updatePillButtonTone()}`}
               onClick={handleUpdatePillClick}
               title={updatePillTitle()}
               aria-label={updatePillTitle()}
@@ -793,15 +838,18 @@ export default function DashboardView(props: DashboardViewProps) {
               <Show
                 when={props.updateStatus?.state === "downloading"}
                 fallback={
-                  <span class="w-2 h-2 rounded-full bg-white/85" />
+                  <Circle
+                    size={8}
+                    class={`${updatePillDotTone()} shrink-0 ${props.updateStatus?.state === "available" ? "group-hover:animate-pulse" : ""}`}
+                  />
                 }
               >
-                <Loader2 size={14} class="animate-spin text-white/90" />
+                <Loader2 size={13} class={`animate-spin shrink-0 ${updatePillDotTone()}`} />
               </Show>
-              <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
+              <span class="flex-1 text-left">{updatePillLabel()}</span>
               <Show when={props.updateStatus?.version}>
                 {(version) => (
-                  <span class="ml-auto text-[11px] text-white/80 font-mono">v{version()}</span>
+                  <span class={`ml-auto font-mono text-[10px] ${updatePillVersionTone()}`}>v{version()}</span>
                 )}
               </Show>
             </button>
@@ -1181,7 +1229,7 @@ export default function DashboardView(props: DashboardViewProps) {
             <Show when={showUpdatePill()}>
               <button
                 type="button"
-                class={`md:hidden flex h-8 items-center gap-2 rounded-full border px-3 text-xs font-medium transition-colors ${updatePillTone()}`}
+                class={`md:hidden flex items-center gap-1.5 rounded-full border bg-dls-surface px-2.5 py-1 text-xs font-medium shadow-sm transition-colors active:scale-[0.99] focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--dls-accent-rgb),0.2)] ${updatePillBorderTone()} ${updatePillButtonTone()}`}
                 onClick={handleUpdatePillClick}
                 title={updatePillTitle()}
                 aria-label={updatePillTitle()}
@@ -1189,15 +1237,18 @@ export default function DashboardView(props: DashboardViewProps) {
                 <Show
                   when={props.updateStatus?.state === "downloading"}
                   fallback={
-                    <span class="w-2 h-2 rounded-full bg-white/85" />
+                    <Circle
+                      size={8}
+                      class={`${updatePillDotTone()} shrink-0 ${props.updateStatus?.state === "available" ? "animate-pulse" : ""}`}
+                    />
                   }
                 >
-                  <Loader2 size={14} class="animate-spin text-white/90" />
+                  <Loader2 size={13} class={`animate-spin shrink-0 ${updatePillDotTone()}`} />
                 </Show>
-                <span class="text-[11px] font-semibold text-white">{updatePillLabel()}</span>
+                <span class="text-[11px]">{updatePillLabel()}</span>
                 <Show when={props.updateStatus?.version}>
                   {(version) => (
-                    <span class="hidden sm:inline text-[11px] text-white/80 font-mono">v{version()}</span>
+                    <span class={`hidden sm:inline font-mono text-[10px] ${updatePillVersionTone()}`}>v{version()}</span>
                   )}
                 </Show>
               </button>
@@ -1239,6 +1290,12 @@ export default function DashboardView(props: DashboardViewProps) {
                 createSessionAndOpen={props.createSessionAndOpen}
                 setPrompt={props.setPrompt}
                 newTaskDisabled={props.newTaskDisabled}
+                schedulerInstalled={props.schedulerPluginInstalled}
+                canEditPlugins={props.canEditPlugins}
+                addPlugin={props.addPlugin}
+                reloadWorkspaceEngine={props.reloadWorkspaceEngine}
+                reloadBusy={props.reloadBusy}
+                canReloadWorkspace={props.canReloadWorkspace}
               />
             </Match>
             <Match when={props.tab === "soul"}>
@@ -1428,6 +1485,11 @@ export default function DashboardView(props: DashboardViewProps) {
                   workspaceDebugEvents={props.workspaceDebugEvents}
                   clearWorkspaceDebugEvents={props.clearWorkspaceDebugEvents}
                   safeStringify={props.safeStringify}
+                  repairOpencodeMigration={props.repairOpencodeMigration}
+                  migrationRepairBusy={props.migrationRepairBusy}
+                  migrationRepairResult={props.migrationRepairResult}
+                  migrationRepairAvailable={props.migrationRepairAvailable}
+                  migrationRepairUnavailableReason={props.migrationRepairUnavailableReason}
                   repairOpencodeCache={props.repairOpencodeCache}
                   cacheRepairBusy={props.cacheRepairBusy}
                   cacheRepairResult={props.cacheRepairResult}

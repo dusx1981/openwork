@@ -4,6 +4,7 @@ import fuzzysort from "fuzzysort";
 import { ArrowUp, AtSign, Check, ChevronDown, File as FileIcon, Paperclip, Square, Terminal, X, Zap } from "lucide-solid";
 
 import type { ComposerAttachment, ComposerDraft, ComposerPart, PromptMode, SlashCommandOption } from "../../types";
+import { perfNow, recordPerfLog } from "../../lib/perf-log";
 
 type MentionOption = {
   id: string;
@@ -21,6 +22,7 @@ type MentionGroup = {
 
 type ComposerProps = {
   prompt: string;
+  developerMode: boolean;
   busy: boolean;
   isStreaming: boolean;
   onSend: (draft: ComposerDraft) => void;
@@ -202,6 +204,8 @@ const compressImageFile = async (file: File): Promise<File> => {
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 const normalizeText = (value: string) => value.replace(/\u00a0/g, " ");
+const RECENT_EMIT_TTL_MS = 30_000;
+const MAX_RECENT_EMITS = 400;
 
 const MODEL_VARIANT_OPTIONS = [
   { value: "none", label: "None" },
@@ -447,6 +451,8 @@ export default function Composer(props: ComposerProps) {
   let mentionSearchRun = 0;
   let suppressPromptSync = false;
   let pasteCounter = 0;
+  let draftScheduledAt = 0;
+  let lastInputAt = 0;
   const pasteTextById = new Map<string, string>();
   const objectUrls = new Set<string>();
   const createObjectUrl = (file: File) => {
@@ -464,6 +470,7 @@ export default function Composer(props: ComposerProps) {
   const [agentLoaded, setAgentLoaded] = createSignal(false);
   const [searchResults, setSearchResults] = createSignal<string[]>([]);
   const [attachments, setAttachments] = createSignal<ComposerAttachment[]>([]);
+  const [draftText, setDraftText] = createSignal(normalizeText(props.prompt));
   const [mode, setMode] = createSignal<PromptMode>("prompt");
   const [historySnapshot, setHistorySnapshot] = createSignal<ComposerDraft | null>(null);
   const [historyIndex, setHistoryIndex] = createSignal({ prompt: -1, shell: -1 });
@@ -472,6 +479,7 @@ export default function Composer(props: ComposerProps) {
   const [showInboxUploadAction, setShowInboxUploadAction] = createSignal(false);
   const activeVariant = createMemo(() => props.modelVariant ?? "none");
   const attachmentsDisabled = createMemo(() => !props.attachmentsEnabled);
+  const hasDraftContent = createMemo(() => draftText().trim().length > 0 || attachments().length > 0);
 
   onCleanup(() => {
     for (const url of objectUrls) {
@@ -587,9 +595,32 @@ export default function Composer(props: ComposerProps) {
     setMentionIndex(0);
   });
 
-  // Track recent emits to distinguish echoes from external updates
-  const recentEmits = new Set<string>();
-  recentEmits.add(props.prompt); // Initialize with current prop
+  // Track recent emits to distinguish echoes from external updates.
+  // Keep a bounded, time-windowed set so stale echoes cannot win races.
+  const recentEmits = new Map<string, number>();
+  const rememberRecentEmit = (value: string) => {
+    const now = Date.now();
+    if (recentEmits.has(value)) {
+      recentEmits.delete(value);
+    }
+    recentEmits.set(value, now);
+
+    for (const [key, timestamp] of recentEmits) {
+      if (now - timestamp <= RECENT_EMIT_TTL_MS) break;
+      recentEmits.delete(key);
+    }
+
+    while (recentEmits.size > MAX_RECENT_EMITS) {
+      const oldest = recentEmits.keys().next();
+      if (oldest.done) break;
+      recentEmits.delete(oldest.value);
+    }
+  };
+
+  const resetRecentEmits = (value: string) => {
+    recentEmits.clear();
+    rememberRecentEmit(value);
+  };
 
   // Sync from props: ignore echoes of what we just sent
   createEffect(() => {
@@ -604,8 +635,8 @@ export default function Composer(props: ComposerProps) {
       // If we've converged (parent matches local), we can clean up the set to save memory,
       // but keeping a few items is cheap and safer for race conditions.
       if (value === current) {
-        recentEmits.clear();
-        recentEmits.add(value);
+        resetRecentEmits(value);
+        setDraftText(value);
       }
       return;
     }
@@ -625,7 +656,8 @@ export default function Composer(props: ComposerProps) {
     }
     if (value === current) {
       // Even if it matches current, make sure it's tracked as a valid base state
-      recentEmits.add(value);
+      rememberRecentEmit(value);
+      setDraftText(value);
       return;
     }
 
@@ -633,13 +665,13 @@ export default function Composer(props: ComposerProps) {
     if (value.startsWith("!") && mode() === "prompt") {
       setMode("shell");
       setEditorText(value.slice(1).trimStart());
-      recentEmits.add(value);
+      rememberRecentEmit(value);
       emitDraftChange();
       queueMicrotask(() => focusEditorEnd());
       return;
     }
 
-    recentEmits.add(value); // It's now the new baseline
+    rememberRecentEmit(value); // It's now the new baseline
     setEditorText(value);
     if (!value) {
       setAttachments([]);
@@ -668,6 +700,7 @@ export default function Composer(props: ComposerProps) {
   const emitDraftChange = () => {
     if (!editorRef) return;
     syncHeight();
+    draftScheduledAt = perfNow();
 
     if (emitTimer) window.clearTimeout(emitTimer);
     emitTimer = window.setTimeout(() => {
@@ -676,27 +709,26 @@ export default function Composer(props: ComposerProps) {
   };
 
   const flushDraftChange = () => {
+    const flushStartedAt = perfNow();
+    const queuedMs = draftScheduledAt > 0 ? Math.round((flushStartedAt - draftScheduledAt) * 100) / 100 : null;
     if (emitTimer) {
       window.clearTimeout(emitTimer);
       emitTimer = null;
     }
     if (!editorRef) return;
+    const buildStartedAt = perfNow();
     const parts = buildPartsFromEditor(editorRef, pasteTextById);
+    const buildMs = Math.round((perfNow() - buildStartedAt) * 100) / 100;
+    const serializeStartedAt = perfNow();
     const text = normalizeText(partsToText(parts));
-
-    recentEmits.add(text); // Track that we sent this, expect an echo later
-
-    // Limit Set size to prevent memory leak (though unlikely to grow huge)
-    if (recentEmits.size > 20) {
-      const it = recentEmits.values();
-      const first = it.next();
-      if (!first.done) {
-        recentEmits.delete(first.value);
-      }
-    }
-
     const resolvedText = normalizeText(partsToResolvedText(parts));
+    const serializeMs = Math.round((perfNow() - serializeStartedAt) * 100) / 100;
+    setDraftText(text);
+
+    rememberRecentEmit(text); // Track that we sent this, expect an echo later
+
     suppressPromptSync = true;
+    const draftChangeStartedAt = perfNow();
     props.onDraftChange({
       mode: mode(),
       parts,
@@ -704,9 +736,56 @@ export default function Composer(props: ComposerProps) {
       text,
       resolvedText,
     });
+    const draftChangeMs = Math.round((perfNow() - draftChangeStartedAt) * 100) / 100;
+    const totalMs = Math.round((perfNow() - flushStartedAt) * 100) / 100;
+    if (
+      props.developerMode &&
+      ((queuedMs !== null && queuedMs >= 90) || buildMs >= 8 || serializeMs >= 8 || draftChangeMs >= 8 || totalMs >= 12 || text.length >= 2_500)
+    ) {
+      recordPerfLog(true, "session.input", "draft-flush", {
+        queuedMs,
+        buildMs,
+        serializeMs,
+        draftChangeMs,
+        totalMs,
+        chars: text.length,
+        parts: parts.length,
+        mode: mode(),
+      });
+    }
+    draftScheduledAt = 0;
     queueMicrotask(() => {
       suppressPromptSync = false;
     });
+  };
+
+  const handleEditorInput = () => {
+    const startedAt = perfNow();
+    const mentionStartedAt = perfNow();
+    updateMentionQuery();
+    const mentionMs = Math.round((perfNow() - mentionStartedAt) * 100) / 100;
+    const slashStartedAt = perfNow();
+    updateSlashQuery();
+    const slashMs = Math.round((perfNow() - slashStartedAt) * 100) / 100;
+    setDraftText(normalizeText(editorRef?.innerText ?? ""));
+    emitDraftChange();
+
+    const totalMs = Math.round((perfNow() - startedAt) * 100) / 100;
+    const now = Date.now();
+    const sincePrevInputMs = lastInputAt > 0 ? now - lastInputAt : null;
+    lastInputAt = now;
+
+    if (props.developerMode && (totalMs >= 8 || mentionMs >= 4 || slashMs >= 4)) {
+      recordPerfLog(true, "session.input", "keystroke", {
+        totalMs,
+        mentionMs,
+        slashMs,
+        sincePrevInputMs,
+        chars: editorRef?.innerText.length ?? 0,
+        mentionOpen: mentionOpen(),
+        slashOpen: slashOpen(),
+      });
+    }
   };
 
   const focusEditorEnd = () => {
@@ -748,6 +827,7 @@ export default function Composer(props: ComposerProps) {
 
   const setEditorText = (value: string) => {
     if (!editorRef) return;
+    setDraftText(normalizeText(value));
     renderParts(value ? [{ type: "text", text: value }] : [], false);
   };
 
@@ -913,6 +993,7 @@ export default function Composer(props: ComposerProps) {
     if (!draft) return;
     setMode(draft.mode);
     renderParts(draft.parts, false);
+    setDraftText(draft.text);
     setAttachments(draft.attachments ?? []);
     props.onDraftChange(draft);
   };
@@ -1639,7 +1720,7 @@ export default function Composer(props: ComposerProps) {
                   </Show>
 
                   <div class="relative">
-                    <Show when={!props.prompt.trim() && !attachments().length}>
+                    <Show when={!hasDraftContent()}>
                       <div class="absolute left-0 top-0 text-dls-secondary text-sm leading-relaxed pointer-events-none">
                         Ask OpenWork...
                       </div>
@@ -1649,11 +1730,7 @@ export default function Composer(props: ComposerProps) {
                       contentEditable={true}
                       role="textbox"
                       aria-multiline="true"
-                      onInput={() => {
-                        updateMentionQuery();
-                        updateSlashQuery();
-                        emitDraftChange();
-                      }}
+                      onInput={handleEditorInput}
                       onKeyDown={handleKeyDown}
                       onPaste={handlePaste}
                       onClick={handleEditorClick}
@@ -1847,9 +1924,9 @@ export default function Composer(props: ComposerProps) {
                           fallback={
                             <button
                               type="button"
-                              disabled={!props.prompt.trim() && !attachments().length}
+                              disabled={!hasDraftContent()}
                               onClick={sendDraft}
-                              class={`p-1.5 rounded-full transition-colors ${!props.prompt.trim() && !attachments().length
+                              class={`p-1.5 rounded-full transition-colors ${!hasDraftContent()
                                 ? "bg-dls-active text-dls-secondary"
                                 : "bg-dls-accent text-white"
                                 }`}
