@@ -199,67 +199,14 @@ export function createExtensionsStore(options: {
       hubSkillsRoot = root;
     } catch (e) {
       if (refreshHubSkillsAborted) return;
-      setHubSkills([]);
-      setHubSkillsStatus(e instanceof Error ? e.message : "Failed to load hub skills.");
+      // Even if everything fails, show our builtin skills
+      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
+      setHubSkills(builtInSkills);
+      if (!builtInSkills.length) setHubSkillsStatus("No hub skills found.");
+      hubSkillsLoaded = true;
+      hubSkillsRoot = root;
     } finally {
       refreshHubSkillsInFlight = false;
-    }
-  }
-
-  async function installHubSkill(name: string): Promise<{ ok: boolean; message: string }> {
-    const trimmed = name.trim();
-    if (!trimmed) return { ok: false, message: "Skill name is required." };
-
-    // Find the skill in the hub skills list to get its source information
-    const hubSkillsList = hubSkills();
-    const skill = hubSkillsList.find(s => s.name === trimmed);
-    
-    const isRemoteWorkspace = options.workspaceType() === "remote";
-    const openworkClient = options.openworkServerClient();
-    const openworkWorkspaceId = options.openworkServerWorkspaceId();
-    const openworkCapabilities = options.openworkServerCapabilities();
-    const canUseOpenworkServer =
-      options.openworkServerStatus() === "connected" &&
-      openworkClient &&
-      openworkWorkspaceId &&
-      openworkCapabilities?.hub?.skills?.install &&
-      typeof (openworkClient as any).installHubSkill === "function";
-
-    if (!canUseOpenworkServer) {
-      if (isRemoteWorkspace) {
-        return { ok: false, message: "OpenWork server unavailable. Connect to install skills." };
-      }
-      return { ok: false, message: "Hub install requires OpenWork server." };
-    }
-
-    options.setBusy(true);
-    options.setError(null);
-    setSkillsStatus(null);
-
-    try {
-      // Pass the skill source information to the server
-      const installOptions: any = {};
-      if (skill?.source) {
-        installOptions.repo = {
-          owner: skill.source.owner,
-          repo: skill.source.repo,
-          ref: skill.source.ref
-        };
-      }
-      
-      const result = await (openworkClient as any).installHubSkill(openworkWorkspaceId, trimmed, installOptions);
-      await refreshSkills({ force: true });
-      await refreshHubSkills({ force: true });
-      if (!result?.ok) {
-        return { ok: false, message: "Install failed." };
-      }
-      return { ok: true, message: `Installed ${trimmed}.` };
-    } catch (e) {
-      const message = e instanceof Error ? e.message : translate("skills.unknown_error");
-      options.setError(addOpencodeCacheHint(message));
-      return { ok: false, message };
-    } finally {
-      options.setBusy(false);
     }
   }
 
