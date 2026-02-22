@@ -176,7 +176,6 @@ export function createExtensionsStore(options: {
     } finally {
       refreshHubSkillsInFlight = false;
     }
-      const listing = (await listingRes.json()) as any;
       const dirs: string[] = Array.isArray(listing)
         ? listing
             .filter((entry) => entry && entry.type === "dir" && typeof entry.name === "string")
