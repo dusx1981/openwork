@@ -128,10 +128,12 @@ export function createExtensionsStore(options: {
       }
 
       // Browser fallback: fetch directly from GitHub (public catalog).
+      console.log("Attempting to fetch skills from GitHub...");
       const listingRes = await fetch("https://api.github.com/repos/different-ai/openwork-hub/contents/skills?ref=main", {
         headers: { Accept: "application/vnd.github+json" },
       });
       if (!listingRes.ok) {
+        console.log(`GitHub fetch failed with status ${listingRes.status}, showing builtin skills`);
         // Even if GitHub fails, we still want to show our builtin skills
         const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
         setHubSkills(builtInSkills);
