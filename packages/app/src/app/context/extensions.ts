@@ -174,6 +174,10 @@ export function createExtensionsStore(options: {
     const trimmed = name.trim();
     if (!trimmed) return { ok: false, message: "Skill name is required." };
 
+    // Find the skill in the hub skills list to get its source information
+    const hubSkillsList = hubSkills();
+    const skill = hubSkillsList.find(s => s.name === trimmed);
+    
     const isRemoteWorkspace = options.workspaceType() === "remote";
     const openworkClient = options.openworkServerClient();
     const openworkWorkspaceId = options.openworkServerWorkspaceId();
@@ -197,7 +201,17 @@ export function createExtensionsStore(options: {
     setSkillsStatus(null);
 
     try {
-      const result = await (openworkClient as any).installHubSkill(openworkWorkspaceId, trimmed);
+      // Pass the skill source information to the server
+      const installOptions: any = {};
+      if (skill?.source) {
+        installOptions.repo = {
+          owner: skill.source.owner,
+          repo: skill.source.repo,
+          ref: skill.source.ref
+        };
+      }
+      
+      const result = await (openworkClient as any).installHubSkill(openworkWorkspaceId, trimmed, installOptions);
       await refreshSkills({ force: true });
       await refreshHubSkills({ force: true });
       if (!result?.ok) {
