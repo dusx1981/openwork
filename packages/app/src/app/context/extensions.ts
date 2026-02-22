@@ -132,7 +132,13 @@ export function createExtensionsStore(options: {
         headers: { Accept: "application/vnd.github+json" },
       });
       if (!listingRes.ok) {
-        throw new Error(`Failed to fetch hub catalog (${listingRes.status})`);
+        // Even if GitHub fails, we still want to show our builtin skills
+        const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
+        setHubSkills(builtInSkills);
+        if (!builtInSkills.length) setHubSkillsStatus("No hub skills found.");
+        hubSkillsLoaded = true;
+        hubSkillsRoot = root;
+        return;
       }
       const listing = (await listingRes.json()) as any;
       const dirs: string[] = Array.isArray(listing)
