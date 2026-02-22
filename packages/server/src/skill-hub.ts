@@ -277,10 +277,14 @@ async function installLocalBuiltinSkill(
   await mkdir(baseDir, { recursive: true });
 
   // Path to local builtin skills in the public directory
-  const localSkillPath = join(__dirname, "..", "..", "app", "public", "builtin", "skills", name, "SKILL.md");
+  const localSkillPath = join(__dirname, "..", "app", "public", "builtin", "skills", name, "SKILL.md");
+  
+  // Debug logging
+  console.log(`Looking for local skill at: ${localSkillPath}`);
+  console.log(`File exists: ${await exists(localSkillPath)}`);
   
   if (!(await exists(localSkillPath))) {
-    throw new ApiError(404, "hub_skill_not_found", `Local builtin skill not found: ${name}`);
+    throw new ApiError(404, "hub_skill_not_found", `Local builtin skill not found: ${name} at ${localSkillPath}`);
   }
 
   // Copy the skill file
