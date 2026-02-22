@@ -7,6 +7,7 @@ import { currentLocale, t } from "../../i18n";
 import type { Client, HubSkillCard, PluginScope, ReloadReason, ReloadTrigger, SkillCard } from "../types";
 import { addOpencodeCacheHint, isTauriRuntime } from "../utils";
 import skillCreatorTemplate from "../data/skill-creator.md?raw";
+import { E_COMMERCE_BUILTIN_SKILLS } from "../data/ecommerce-skills";
 import {
   isPluginInstalled,
   loadPluginsFromConfig as loadPluginsFromConfigHelpers,
@@ -117,6 +118,8 @@ export function createExtensionsStore(options: {
               source: entry.source,
             }))
           : [];
+        const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
+        next.push(...builtInSkills);
         setHubSkills(next);
         if (!next.length) setHubSkillsStatus("No hub skills found.");
         hubSkillsLoaded = true;
@@ -142,6 +145,9 @@ export function createExtensionsStore(options: {
         name: dirName,
         source: { owner: "different-ai", repo: "openwork-hub", ref: "main", path: `skills/${dirName}` },
       }));
+
+      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
+      next.push(...builtInSkills);
 
       if (refreshHubSkillsAborted) return;
       const sorted = next.slice().sort((a, b) => a.name.localeCompare(b.name));
