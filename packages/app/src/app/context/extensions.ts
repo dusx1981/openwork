@@ -142,6 +142,40 @@ export function createExtensionsStore(options: {
         hubSkillsRoot = root;
         return;
       }
+      
+      const listing = (await listingRes.json()) as any;
+      const dirs: string[] = Array.isArray(listing)
+        ? listing
+            .filter((entry) => entry && entry.type === "dir" && typeof entry.name === "string")
+            .map((entry) => String(entry.name))
+        : [];
+
+      const next: HubSkillCard[] = dirs.map((dirName) => ({
+        name: dirName,
+        source: { owner: "different-ai", repo: "openwork-hub", ref: "main", path: `skills/${dirName}` },
+      }));
+
+      // Always add our builtin skills
+      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
+      next.push(...builtInSkills);
+
+      if (refreshHubSkillsAborted) return;
+      const sorted = next.slice().sort((a, b) => a.name.localeCompare(b.name));
+      setHubSkills(sorted);
+      if (!sorted.length) setHubSkillsStatus("No hub skills found.");
+      hubSkillsLoaded = true;
+      hubSkillsRoot = root;
+    } catch (e) {
+      console.log("Error loading hub skills:", e);
+      // Even if everything fails, show our builtin skills
+      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
+      setHubSkills(builtInSkills);
+      if (!builtInSkills.length) setHubSkillsStatus("No hub skills found.");
+      hubSkillsLoaded = true;
+      hubSkillsRoot = root;
+    } finally {
+      refreshHubSkillsInFlight = false;
+    }
       const listing = (await listingRes.json()) as any;
       const dirs: string[] = Array.isArray(listing)
         ? listing
