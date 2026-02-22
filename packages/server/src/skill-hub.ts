@@ -277,19 +277,32 @@ async function installLocalBuiltinSkill(
   await mkdir(baseDir, { recursive: true });
 
   // Path to local builtin skills in the public directory
+  // From server directory: ../../app/public/builtin/skills/name/SKILL.md
   const localSkillPath = join(__dirname, "..", "app", "public", "builtin", "skills", name, "SKILL.md");
   
   // Debug logging
   console.log(`Looking for local skill at: ${localSkillPath}`);
   console.log(`File exists: ${await exists(localSkillPath)}`);
+  console.log(`Current directory: ${process.cwd()}`);
   
   if (!(await exists(localSkillPath))) {
-    throw new ApiError(404, "hub_skill_not_found", `Local builtin skill not found: ${name} at ${localSkillPath}`);
+    // Try alternative path (when running from project root)
+    const altPath = join(process.cwd(), "packages", "app", "public", "builtin", "skills", name, "SKILL.md");
+    console.log(`Trying alternative path: ${altPath}`);
+    console.log(`Alt file exists: ${await exists(altPath)}`);
+    
+    if (!(await exists(altPath))) {
+      throw new ApiError(404, "hub_skill_not_found", `Local builtin skill not found: ${name}`);
+    }
+    
+    // Copy from alternative path
+    const skillContent = await readFile(altPath);
+    await writeFile(skillMdPath, skillContent);
+  } else {
+    // Copy the skill file
+    const skillContent = await readFile(localSkillPath);
+    await writeFile(skillMdPath, skillContent);
   }
-
-  // Copy the skill file
-  const skillContent = await readFile(localSkillPath);
-  await writeFile(skillMdPath, skillContent);
 
   return {
     name,
