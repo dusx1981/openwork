@@ -10,6 +10,7 @@
   },
   "model": "openai/gpt-5.2-codex",
   "plugin": [
-    "opencode-scheduler"
+    "opencode-scheduler",
+    "file:./.opencode/plugins/e-commerce-agents"
   ]
 }
