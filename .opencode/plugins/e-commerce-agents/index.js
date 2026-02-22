@@ -1,4 +1,3 @@
-import type { Plugin } from "@opencode-ai/plugin";
 import { fetchMarketData } from "./tools/market.js";
 import { searchTrends } from "./tools/trends.js";
 import { analyzeCompetitors } from "./tools/competitors.js";
@@ -15,7 +14,7 @@ import { generateResponse } from "./tools/response.js";
 import { translateContent } from "./tools/translate.js";
 import { initializeKnowledgeBase } from "./lib/knowledge-base.js";
 
-export const ECommerceAgentsPlugin: Plugin = async (context) => {
+export const ECommerceAgentsPlugin = async (context) => {
   await initializeKnowledgeBase(context);
 
   return {
