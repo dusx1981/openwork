@@ -1,9 +1,0 @@
-{
-  "name": "e-commerce-agents",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "index.js",
-  "dependencies": {
-    "@opencode-ai/plugin": "1.2.10"
-  }
-}

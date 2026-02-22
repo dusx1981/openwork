@@ -1,6 +1,0 @@
-{
-  "dependencies": {
-    "@opencode-ai/plugin": "1.2.10",
-    "e-commerce-agents": "file:./plugins/e-commerce-agents"
-  }
-}
