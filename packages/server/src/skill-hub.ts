@@ -1,5 +1,6 @@
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { HubSkillItem } from "./types.js";
 import { ApiError } from "./errors.js";
@@ -7,6 +8,9 @@ import { parseFrontmatter } from "./frontmatter.js";
 import { exists } from "./utils.js";
 import { validateSkillName } from "./validators.js";
 import { projectSkillsDir } from "./workspace-files.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 type HubRepo = { owner: string; repo: string; ref: string };
 
@@ -181,6 +185,11 @@ export async function installHubSkill(
   validateSkillName(name);
   const overwrite = Boolean(input.overwrite);
 
+  // Special case for local builtin skills
+  if (input.repo?.owner === "local" && input.repo?.repo === "builtin") {
+    return await installLocalBuiltinSkill(workspaceRoot, name, overwrite);
+  }
+
   const repo: HubRepo = {
     owner: input.repo?.owner?.trim() || DEFAULT_HUB_REPO.owner,
     repo: input.repo?.repo?.trim() || DEFAULT_HUB_REPO.repo,
@@ -253,5 +262,36 @@ export async function installHubSkill(
     action: existedBefore ? "updated" : "added",
     written,
     skipped,
+  };
+}
+
+async function installLocalBuiltinSkill(
+  workspaceRoot: string,
+  name: string,
+  overwrite: boolean,
+): Promise<{ name: string; path: string; action: "added" | "updated"; written: number; skipped: number }> {
+  const baseDir = join(projectSkillsDir(workspaceRoot), name);
+  const skillMdPath = join(baseDir, "SKILL.md");
+  const existedBefore = await exists(skillMdPath);
+
+  await mkdir(baseDir, { recursive: true });
+
+  // Path to local builtin skills in the public directory
+  const localSkillPath = join(__dirname, "..", "..", "app", "public", "builtin", "skills", name, "SKILL.md");
+  
+  if (!(await exists(localSkillPath))) {
+    throw new ApiError(404, "hub_skill_not_found", `Local builtin skill not found: ${name}`);
+  }
+
+  // Copy the skill file
+  const skillContent = await readFile(localSkillPath);
+  await writeFile(skillMdPath, skillContent);
+
+  return {
+    name,
+    path: baseDir,
+    action: existedBefore ? "updated" : "added",
+    written: 1,
+    skipped: 0,
   };
 }
