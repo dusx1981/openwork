@@ -158,6 +158,35 @@ export interface HubSkillItem {
   };
 }
 
+export interface AgentItem {
+  name: string;
+  path: string;
+  description: string;
+  scope: "project" | "global";
+  trigger?: string;
+  model?: string;
+  subAgents?: string[];
+  skills?: string[];
+  maxTurns?: number;
+  systemPrompt?: string;
+}
+
+export interface HubAgentItem {
+  name: string;
+  description: string;
+  trigger?: string;
+  source: {
+    owner: string;
+    repo: string;
+    ref: string;
+    path: string;
+  };
+  model?: string;
+  subAgents?: string[];
+  skills?: string[];
+  maxTurns?: number;
+}
+
 export interface CommandItem {
   name: string;
   description?: string;

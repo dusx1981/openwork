@@ -7,7 +7,6 @@ import { currentLocale, t } from "../../i18n";
 import type { Client, HubSkillCard, PluginScope, ReloadReason, ReloadTrigger, SkillCard } from "../types";
 import { addOpencodeCacheHint, isTauriRuntime } from "../utils";
 import skillCreatorTemplate from "../data/skill-creator.md?raw";
-import { E_COMMERCE_BUILTIN_SKILLS } from "../data/ecommerce-skills";
 import {
   isPluginInstalled,
   loadPluginsFromConfig as loadPluginsFromConfigHelpers,
@@ -108,7 +107,9 @@ export function createExtensionsStore(options: {
       setHubSkillsStatus(null);
 
       if (canUseOpenworkServer) {
+        console.log("Fetching hub skills from OpenWork server...");
         const response = await (openworkClient as any).listHubSkills();
+        console.log("Server response:", response);
         if (refreshHubSkillsAborted) return;
         const next: HubSkillCard[] = Array.isArray(response?.items)
           ? response.items.map((entry: any) => ({
@@ -118,8 +119,7 @@ export function createExtensionsStore(options: {
               source: entry.source,
             }))
           : [];
-        const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
-        next.push(...builtInSkills);
+        console.log("Hub skills from server:", next.length);
         setHubSkills(next);
         if (!next.length) setHubSkillsStatus("No hub skills found.");
         hubSkillsLoaded = true;
@@ -133,11 +133,9 @@ export function createExtensionsStore(options: {
         headers: { Accept: "application/vnd.github+json" },
       });
       if (!listingRes.ok) {
-        console.log(`GitHub fetch failed with status ${listingRes.status}, showing builtin skills`);
-        // Even if GitHub fails, we still want to show our builtin skills
-        const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
-        setHubSkills(builtInSkills);
-        if (!builtInSkills.length) setHubSkillsStatus("No hub skills found.");
+        console.log(`GitHub fetch failed with status ${listingRes.status}`);
+        setHubSkills([]);
+        setHubSkillsStatus("No hub skills found.");
         hubSkillsLoaded = true;
         hubSkillsRoot = root;
         return;
@@ -155,10 +153,6 @@ export function createExtensionsStore(options: {
         source: { owner: "different-ai", repo: "openwork-hub", ref: "main", path: `skills/${dirName}` },
       }));
 
-      // Always add our builtin skills
-      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
-      next.push(...builtInSkills);
-
       if (refreshHubSkillsAborted) return;
       const sorted = next.slice().sort((a, b) => a.name.localeCompare(b.name));
       setHubSkills(sorted);
@@ -167,45 +161,67 @@ export function createExtensionsStore(options: {
       hubSkillsRoot = root;
     } catch (e) {
       console.log("Error loading hub skills:", e);
-      // Even if everything fails, show our builtin skills
-      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
-      setHubSkills(builtInSkills);
-      if (!builtInSkills.length) setHubSkillsStatus("No hub skills found.");
+      setHubSkills([]);
+      setHubSkillsStatus("No hub skills found.");
       hubSkillsLoaded = true;
       hubSkillsRoot = root;
     } finally {
       refreshHubSkillsInFlight = false;
     }
-      const dirs: string[] = Array.isArray(listing)
-        ? listing
-            .filter((entry) => entry && entry.type === "dir" && typeof entry.name === "string")
-            .map((entry) => String(entry.name))
-        : [];
+  }
 
-      const next: HubSkillCard[] = dirs.map((dirName) => ({
-        name: dirName,
-        source: { owner: "different-ai", repo: "openwork-hub", ref: "main", path: `skills/${dirName}` },
-      }));
+  async function installHubSkill(name: string): Promise<{ ok: boolean; message: string }> {
+    const trimmed = name.trim();
+    if (!trimmed) return { ok: false, message: "Skill name is required." };
 
-      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
-      next.push(...builtInSkills);
+    const hubSkillsList = hubSkills();
+    const skill = hubSkillsList.find((s) => s.name === trimmed);
 
-      if (refreshHubSkillsAborted) return;
-      const sorted = next.slice().sort((a, b) => a.name.localeCompare(b.name));
-      setHubSkills(sorted);
-      if (!sorted.length) setHubSkillsStatus("No hub skills found.");
-      hubSkillsLoaded = true;
-      hubSkillsRoot = root;
+    const isRemoteWorkspace = options.workspaceType() === "remote";
+    const openworkClient = options.openworkServerClient();
+    const openworkWorkspaceId = options.openworkServerWorkspaceId();
+    const openworkCapabilities = options.openworkServerCapabilities();
+    const canUseOpenworkServer =
+      options.openworkServerStatus() === "connected" &&
+      openworkClient &&
+      openworkWorkspaceId &&
+      openworkCapabilities?.hub?.skills?.install &&
+      typeof (openworkClient as any).installHubSkill === "function";
+
+    if (!canUseOpenworkServer) {
+      if (isRemoteWorkspace) {
+        return { ok: false, message: "OpenWork server unavailable. Connect to install skills." };
+      }
+      return { ok: false, message: "Hub install requires OpenWork server." };
+    }
+
+    options.setBusy(true);
+    options.setError(null);
+    setSkillsStatus(null);
+
+    try {
+      const installOptions: any = {};
+      if (skill?.source) {
+        installOptions.repo = {
+          owner: skill.source.owner,
+          repo: skill.source.repo,
+          ref: skill.source.ref,
+        };
+      }
+
+      const result = await (openworkClient as any).installHubSkill(openworkWorkspaceId, trimmed, installOptions);
+      await refreshSkills({ force: true });
+      await refreshHubSkills({ force: true });
+      if (!result?.ok) {
+        return { ok: false, message: "Install failed." };
+      }
+      return { ok: true, message: `Installed ${trimmed}.` };
     } catch (e) {
-      if (refreshHubSkillsAborted) return;
-      // Even if everything fails, show our builtin skills
-      const builtInSkills = E_COMMERCE_BUILTIN_SKILLS;
-      setHubSkills(builtInSkills);
-      if (!builtInSkills.length) setHubSkillsStatus("No hub skills found.");
-      hubSkillsLoaded = true;
-      hubSkillsRoot = root;
+      const message = e instanceof Error ? e.message : translate("skills.unknown_error");
+      options.setError(addOpencodeCacheHint(message));
+      return { ok: false, message };
     } finally {
-      refreshHubSkillsInFlight = false;
+      options.setBusy(false);
     }
   }
 

@@ -6,7 +6,8 @@ import { ApprovalService } from "./approvals.js";
 import { addPlugin, listPlugins, normalizePluginSpec, removePlugin } from "./plugins.js";
 import { addMcp, listMcp, removeMcp } from "./mcp.js";
 import { deleteSkill, listSkills, upsertSkill } from "./skills.js";
-import { installHubSkill, listHubSkills } from "./skill-hub.js";
+import { deleteAgent, getAgentContent, listAgents, upsertAgent } from "./agents.js";
+import { installHubAgent, installHubSkill, listHubAgents, listHubSkills } from "./skill-hub.js";
 import { deleteCommand, listCommands, upsertCommand } from "./commands.js";
 import { deleteScheduledJob, listScheduledJobs, resolveScheduledJob } from "./scheduler.js";
 import { ApiError, formatError } from "./errors.js";
@@ -2628,6 +2629,95 @@ function createRoutes(config: ServerConfig, approvals: ApprovalService, tokens: 
     });
     emitReloadEvent(ctx.reloadEvents, workspace, "skills", {
       type: "skill",
+      name,
+      action: "removed",
+      path: result.path,
+    });
+    return jsonResponse({ ok: true, name, path: result.path });
+  });
+
+  // Agent routes
+  addRoute(routes, "GET", "/workspace/:id/agents", "client", async (ctx) => {
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const includeGlobal = ctx.url.searchParams.get("includeGlobal") === "true";
+    const items = await listAgents(workspace.path, includeGlobal);
+    return jsonResponse({ items });
+  });
+
+  addRoute(routes, "GET", "/workspace/:id/agents/:name", "client", async (ctx) => {
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const includeGlobal = ctx.url.searchParams.get("includeGlobal") === "true";
+    const name = String(ctx.params.name ?? "").trim();
+    if (!name) {
+      throw new ApiError(400, "invalid_agent_name", "Agent name is required");
+    }
+    const { item, content } = await getAgentContent(workspace.path, name, includeGlobal);
+    return jsonResponse({ item, content });
+  });
+
+  addRoute(routes, "POST", "/workspace/:id/agents", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const name = String(body.name ?? "");
+    const content = String(body.content ?? "");
+    const description = body.description ? String(body.description) : undefined;
+    const model = body.model ? String(body.model) : undefined;
+    const subAgents = body.subAgents && Array.isArray(body.subAgents) ? body.subAgents : undefined;
+    const skills = body.skills && Array.isArray(body.skills) ? body.skills : undefined;
+    const maxTurns = body.maxTurns && typeof body.maxTurns === "number" ? body.maxTurns : undefined;
+    await requireApproval(ctx, {
+      workspaceId: workspace.id,
+      action: "agents.upsert",
+      summary: `Upsert agent ${name}`,
+      paths: [join(workspace.path, ".opencode", "agents", name, "AGENT.md")],
+    });
+    const result = await upsertAgent(workspace.path, { name, content, description, model, subAgents, skills, maxTurns });
+    await recordAudit(workspace.path, {
+      id: shortId(),
+      workspaceId: workspace.id,
+      actor: ctx.actor ?? { type: "remote" },
+      action: "agents.upsert",
+      target: result.path,
+      summary: `Upserted agent ${name}`,
+      timestamp: Date.now(),
+    });
+    emitReloadEvent(ctx.reloadEvents, workspace, "agents", {
+      type: "agent",
+      name,
+      action: result.action,
+      path: result.path,
+    });
+    return jsonResponse({ name, path: result.path, description: description ?? "", scope: "project" });
+  });
+
+  addRoute(routes, "DELETE", "/workspace/:id/agents/:name", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const name = String(ctx.params.name ?? "").trim();
+    if (!name) {
+      throw new ApiError(400, "invalid_agent_name", "Agent name is required");
+    }
+    await requireApproval(ctx, {
+      workspaceId: workspace.id,
+      action: "agents.delete",
+      summary: `Delete agent ${name}`,
+      paths: [join(workspace.path, ".opencode", "agents", name)],
+    });
+    const result = await deleteAgent(workspace.path, name);
+    await recordAudit(workspace.path, {
+      id: shortId(),
+      workspaceId: workspace.id,
+      actor: ctx.actor ?? { type: "remote" },
+      action: "agents.delete",
+      target: result.path,
+      summary: `Deleted agent ${name}`,
+      timestamp: Date.now(),
+    });
+    emitReloadEvent(ctx.reloadEvents, workspace, "agents", {
+      type: "agent",
       name,
       action: "removed",
       path: result.path,

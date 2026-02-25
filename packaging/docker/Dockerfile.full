@@ -1,0 +1,21 @@
+FROM debian:bookworm-slim AS runner
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    nginx \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY packages/server/dist/bin/openwork-server /usr/local/bin/openwork-server
+COPY packages/app/dist /var/www/openwork
+
+COPY packaging/docker/nginx.conf /etc/nginx/nginx.conf
+
+RUN mkdir -p /data/openwork-orchestrator /workspace
+
+ENV OPENWORK_DATA_DIR=/data/openwork-orchestrator
+ENV OPENWORK_WORKSPACE=/workspace
+
+EXPOSE 80 8787
+
+CMD sh -c "nginx -g 'daemon off;' & openwork-server serve --workspace /workspace --host 0.0.0.0 --port 8787 --cors '*' --approval manual"
