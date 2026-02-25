@@ -1,0 +1,22 @@
+name: openwork-skills
+version: 0.1.0
+description: All OpenWork skills for AI coding assistance
+skills:
+  - ./skills/ecommerce-hub
+  - ./skills/ops-support
+  - ./skills/gtm
+  - ./skills/product-planning
+  - ./skills/market-insight
+  - ./skills/opencode-primitives
+  - ./skills/solidjs-patterns
+  - ./skills/get-started
+  - ./skills/openwork-debug
+  - ./skills/openwork-core
+  - ./skills/tauri-solidjs
+  - ./skills/browser-setup-devtools
+  - ./skills/release
+  - ./skills/openwork-docker-chrome-mcp
+  - ./skills/opencode-bridge
+  - ./skills/opencode-mirror
+  - ./skills/openwork-orchestrator-npm-publish
+  - ./skills/cargo-lock-manager

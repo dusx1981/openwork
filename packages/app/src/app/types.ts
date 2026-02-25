@@ -171,6 +171,26 @@ export type WorkspaceOpenworkConfig = {
   } | null;
 };
 
+export type AgentCard = {
+  name: string;
+  path: string;
+  description?: string;
+  trigger?: string;
+};
+
+export type HubAgentCard = {
+  name: string;
+  description?: string;
+  trigger?: string;
+  source: {
+    owner: string;
+    repo: string;
+    ref: string;
+    path: string;
+  };
+};
+
+
 export type SkillCard = {
   name: string;
   path: string;

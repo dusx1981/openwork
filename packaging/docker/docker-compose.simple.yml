@@ -1,0 +1,61 @@
+version: "3.8"
+
+services:
+  orchestrator:
+    image: node:22-bookworm-slim
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+          curl ca-certificates >/dev/null 2>&1
+
+        if [ -z "$OPENWORK_TOKEN" ]; then
+          OPENWORK_TOKEN="$(cat /proc/sys/kernel/random/uuid)"
+          export OPENWORK_TOKEN
+        fi
+        if [ -z "$OPENWORK_HOST_TOKEN" ]; then
+          OPENWORK_HOST_TOKEN="$(cat /proc/sys/kernel/random/uuid)"
+          export OPENWORK_HOST_TOKEN
+        fi
+
+        echo ""
+        echo "============================================"
+        echo "  OpenWork Server"
+        echo "  Server:     http://localhost:8787"
+        echo "  Token:      $OPENWORK_TOKEN"
+        echo "  Host token: $OPENWORK_HOST_TOKEN"
+        echo "============================================"
+        echo ""
+
+        exec /usr/local/bin/openwork-server serve \
+          --workspace /workspace \
+          --host 0.0.0.0 \
+          --port 8787 \
+          --token "$OPENWORK_TOKEN" \
+          --host-token "$OPENWORK_HOST_TOKEN" \
+          --approval ${OPENWORK_APPROVAL:-auto} \
+          --cors "*"
+    ports:
+      - "${OPENWORK_PORT:-8787}:8787"
+    volumes:
+      - ${OPENWORK_WORKSPACE:-./workspace}:/workspace
+      - ${OPENWORK_DATA:-./data}:/data
+    environment:
+      OPENWORK_TOKEN: ${OPENWORK_TOKEN:-}
+      OPENWORK_HOST_TOKEN: ${OPENWORK_HOST_TOKEN:-}
+      OPENWORK_APPROVAL: ${OPENWORK_APPROVAL:-auto}
+
+  web:
+    image: nginx:alpine
+    ports:
+      - "${WEB_PORT:-80}:80"
+    volumes:
+      - ${OPENWORK_WEB_UI:-./web-ui}:/usr/share/nginx/html:ro
+      - type: bind
+        source: ./nginx-simple.conf
+        target: /etc/nginx/nginx.conf
+    depends_on:
+      - orchestrator
+    command: ["nginx", "-g", "daemon off;"]

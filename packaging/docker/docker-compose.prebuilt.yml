@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  orchestrator:
+    image: openwork:full
+    ports:
+      - "${OPENWORK_PORT:-8787}:8787"
+    volumes:
+      - ${OPENWORK_WORKSPACE:-./workspace}:/workspace
+    environment:
+      OPENWORK_TOKEN: ${OPENWORK_TOKEN:-}
+      OPENWORK_HOST_TOKEN: ${OPENWORK_HOST_TOKEN:-}
+      OPENWORK_APPROVAL: ${OPENWORK_APPROVAL:-manual}
+
+  web:
+    image: nginx:alpine
+    ports:
+      - "${WEB_PORT:-80}:80"
+    volumes:
+      - ${OPENWORK_WEB_UI:-./web-ui}:/usr/share/nginx/html:ro
+      - type: bind
+        source: ./nginx-simple.conf
+        target: /etc/nginx/nginx.conf
+    depends_on:
+      - orchestrator
+    command: ["nginx", "-g", "daemon off;"]
