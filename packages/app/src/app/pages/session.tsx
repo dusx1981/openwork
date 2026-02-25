@@ -52,16 +52,23 @@ import {
 import Button from "../components/button";
 import ConfirmModal from "../components/confirm-modal";
 import RenameSessionModal from "../components/rename-session-modal";
-import ProviderAuthModal from "../components/provider-auth-modal";
+import ProviderAuthModal, { type ProviderOAuthStartResult } from "../components/provider-auth-modal";
 import ShareWorkspaceModal from "../components/share-workspace-modal";
 import StatusBar from "../components/status-bar";
-import { buildOpenworkWorkspaceBaseUrl, createOpenworkServerClient } from "../lib/openwork-server";
+import {
+  buildOpenworkConnectInviteUrl,
+  buildOpenworkWorkspaceBaseUrl,
+  createOpenworkServerClient,
+  parseOpenworkWorkspaceIdFromUrl,
+} from "../lib/openwork-server";
 import type {
   OpenworkServerClient,
   OpenworkServerSettings,
   OpenworkServerStatus,
   OpenworkSoulStatus,
+  OpenworkWorkspaceExport,
 } from "../lib/openwork-server";
+import { DEFAULT_OPENWORK_PUBLISHER_BASE_URL, publishOpenworkBundleJson } from "../lib/publisher";
 import { join } from "@tauri-apps/api/path";
 import {
   formatRelativeTime,
@@ -187,7 +194,8 @@ export type SessionViewProps = {
   error: string | null;
   sessionStatus: string;
   renameSession: (sessionId: string, title: string) => Promise<void>;
-  startProviderAuth: (providerId?: string) => Promise<string>;
+  startProviderAuth: (providerId?: string) => Promise<ProviderOAuthStartResult>;
+  completeProviderAuthOAuth: (providerId: string, methodIndex: number, code?: string) => Promise<string | void>;
   submitProviderApiKey: (providerId: string, apiKey: string) => Promise<string | void>;
   openProviderAuthModal: () => Promise<void>;
   closeProviderAuthModal: () => void;
@@ -205,6 +213,33 @@ export type SessionViewProps = {
   saveSession: (sessionId: string) => Promise<string>;
   sessionStatusById: Record<string, string>;
   deleteSession: (sessionId: string) => Promise<void>;
+};
+
+type SharedSkillItem = {
+  name: string;
+  description?: string;
+  content: string;
+  trigger?: string;
+};
+
+type WorkspaceProfileBundleV1 = {
+  schemaVersion: 1;
+  type: "workspace-profile";
+  name: string;
+  description: string;
+  workspace: OpenworkWorkspaceExport;
+};
+
+type SkillsSetBundleV1 = {
+  schemaVersion: 1;
+  type: "skills-set";
+  name: string;
+  description: string;
+  skills: SharedSkillItem[];
+  sourceWorkspace?: {
+    id?: string;
+    name?: string;
+  };
 };
 
 const BROWSER_SETUP_TEMPLATE = (() => {
@@ -225,6 +260,7 @@ const SOUL_SETUP_TEMPLATE = (() => {
   return { name, description, body };
 })();
 
+const INITIAL_MESSAGE_WINDOW = 140;
 const MESSAGE_WINDOW_LOAD_CHUNK = 120;
 const MAX_SEARCH_MESSAGE_CHARS = 4_000;
 const MAX_SEARCH_HITS = 2_000;
@@ -245,6 +281,7 @@ const COMMAND_PALETTE_THINKING_OPTIONS = [
 
 export default function SessionView(props: SessionViewProps) {
   let messagesEndEl: HTMLDivElement | undefined;
+  let bottomVisibilityEl: HTMLDivElement | undefined;
   let chatContainerEl: HTMLDivElement | undefined;
   let agentPickerRef: HTMLDivElement | undefined;
   let sessionMenuRef: HTMLDivElement | undefined;
@@ -791,7 +828,7 @@ export default function SessionView(props: SessionViewProps) {
     if (!total) return "";
     return `${todoCompletedCount()} out of ${total} tasks completed`;
   });
-  const MAX_SESSIONS_PREVIEW = 3;
+  const MAX_SESSIONS_PREVIEW = 6;
   const COLLAPSED_SESSIONS_PREVIEW = 1;
   const [expandedWorkspaceIds, setExpandedWorkspaceIds] = createSignal<Set<string>>(
     new Set()
@@ -893,22 +930,6 @@ export default function SessionView(props: SessionViewProps) {
     onCleanup(() => window.removeEventListener("click", closeMenu));
   });
 
-  createEffect(() => {
-    if (!addWorkspaceMenuOpen()) return;
-    const closeMenu = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (addWorkspaceMenuRef && target && addWorkspaceMenuRef.contains(target)) return;
-      setAddWorkspaceMenuOpen(false);
-    };
-    window.addEventListener("click", closeMenu);
-    onCleanup(() => window.removeEventListener("click", closeMenu));
-  });
-
-  const isNearBottom = (el: HTMLElement, threshold = 80) => {
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    return distance <= threshold;
-  };
-
   const scrollToLatest = (behavior: ScrollBehavior = "auto") => {
     messagesEndEl?.scrollIntoView({ behavior, block: "end" });
   };
@@ -946,12 +967,34 @@ export default function SessionView(props: SessionViewProps) {
 
   createEffect(
     on(
-      () => props.selectedSessionId,
-      (sessionId, previousSessionId) => {
+      () => [props.selectedSessionId, props.messages.length] as const,
+      ([sessionId, count], previous) => {
+        const previousSessionId = previous?.[0] ?? null;
         if (sessionId !== previousSessionId) {
-          setMessageWindowSessionId(sessionId ?? null);
+          setMessageWindowSessionId(null);
           setMessageWindowExpanded(false);
           setMessageWindowStart(0);
+        }
+
+        if (!sessionId) return;
+        if (messageWindowExpanded()) return;
+        if (count === 0) return;
+
+        const targetStart = count > INITIAL_MESSAGE_WINDOW ? count - INITIAL_MESSAGE_WINDOW : 0;
+        if (messageWindowSessionId() !== sessionId) {
+          setMessageWindowStart(targetStart);
+          setMessageWindowSessionId(sessionId);
+          return;
+        }
+
+        const currentStart = messageWindowStart();
+        if (currentStart <= 0 && targetStart > 0) {
+          setMessageWindowStart(targetStart);
+          return;
+        }
+
+        if (nearBottom() && targetStart > currentStart) {
+          setMessageWindowStart(targetStart);
         }
       },
       { defer: true },
@@ -1112,34 +1155,13 @@ export default function SessionView(props: SessionViewProps) {
     return null;
   });
 
-  const cleanReasoning = (value: string) => value.replace(/\[REDACTED\]/g, "").trim();
-
-  const latestRunReasoning = createMemo<string | null>(() => {
-    if (!showRunIndicator()) return null;
-    const baseline = runBaseline();
-    for (let i = props.messages.length - 1; i >= 0; i -= 1) {
-      const msg = props.messages[i];
-      const info = msg?.info as { id?: string | number; role?: string } | undefined;
-      if (info?.role !== "assistant") continue;
-      const messageId =
-        typeof info.id === "string" ? info.id : typeof info.id === "number" ? String(info.id) : null;
-      if (!messageId) continue;
-
-      const minIndex = baseline.assistantId && messageId === baseline.assistantId ? baseline.partCount - 1 : -1;
-      for (let partIndex = msg.parts.length - 1; partIndex > minIndex; partIndex -= 1) {
-        const part = msg.parts[partIndex];
-        if (part?.type !== "reasoning") continue;
-        const raw = typeof (part as { text?: unknown }).text === "string" ? String((part as { text?: string }).text) : "";
-        const text = cleanReasoning(raw);
-        if (text) return text;
-      }
-
-      if (baseline.assistantId && messageId === baseline.assistantId) {
-        break;
-      }
-    }
-    return null;
-  });
+  const cleanReasoning = (value: string) =>
+    value
+      .replace(/\[REDACTED\]/g, "")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/__([^_]+)__/g, "$1")
+      .replace(/`([^`]+)`/g, "$1")
+      .trim();
 
   const computeStatusFromPart = (part: Part | null) => {
     if (!part) return null;
@@ -1171,9 +1193,15 @@ export default function SessionView(props: SessionViewProps) {
       }
     }
     if (part.type === "reasoning") {
-      const text = typeof (part as any).text === "string" ? (part as any).text : "";
-      const match = text.trimStart().match(/^\*\*(.+?)\*\*/);
-      if (match) return `Thinking about ${match[1].trim()}`;
+      const text = cleanReasoning(typeof (part as any).text === "string" ? (part as any).text : "");
+      const first = text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (first) {
+        const clipped = first.length > 56 ? `${first.slice(0, 53)}...` : first;
+        return `Thinking: ${clipped}`;
+      }
       return "Thinking";
     }
     if (part.type === "text") {
@@ -1182,65 +1210,10 @@ export default function SessionView(props: SessionViewProps) {
     return null;
   };
 
-  const truncateDetail = (value: string, max = 240) => {
-    const trimmed = value.trim();
-    if (!trimmed) return null;
-    if (trimmed.length <= max) return trimmed;
-    return `${trimmed.slice(0, max)}...`;
-  };
-
-  const formatRunErrorDetail = (message: string) => {
-    const lines = message
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    if (!lines.length) return "Run failed";
-    const compact = lines.slice(0, 4).join("\n");
-    if (lines.length <= 4) return compact;
-    return `${compact}\n...`;
-  };
-
   const thinkingStatus = createMemo(() => {
     const status = computeStatusFromPart(latestRunPart());
     if (status) return status;
     if (runPhase() === "thinking") return "Thinking";
-    return null;
-  });
-
-  const thinkingDetail = createMemo<null | { title: string; detail?: string }>(() => {
-    if (runPhase() === "error") {
-      if (!props.error) return { title: "Error" };
-      const detail = truncateDetail(formatRunErrorDetail(props.error), 420);
-      return detail ? { title: "Error", detail } : { title: "Error" };
-    }
-
-    const reasoning = latestRunReasoning();
-    if (reasoning) {
-      const detail = truncateDetail(reasoning);
-      return detail ? { title: "Reasoning", detail } : { title: "Reasoning" };
-    }
-
-    const part = latestRunPart();
-    if (!part) return null;
-    if (part.type === "tool") {
-      const record = part as any;
-      const state = record.state ?? {};
-      const title =
-        typeof state.title === "string" && state.title.trim() ? state.title.trim() : String(record.tool ?? "Tool");
-      const output = typeof state.output === "string" ? truncateDetail(state.output) : null;
-      const error = typeof state.error === "string" ? truncateDetail(state.error) : null;
-      return { title, detail: output ?? error ?? undefined };
-    }
-    if (part.type === "reasoning") {
-      const text = cleanReasoning(typeof (part as any).text === "string" ? (part as any).text : "");
-      const detail = truncateDetail(text);
-      return detail ? { title: "Reasoning", detail } : { title: "Reasoning" };
-    }
-    if (part.type === "text") {
-      const text = typeof (part as any).text === "string" ? (part as any).text : "";
-      const detail = truncateDetail(text);
-      return detail ? { title: "Draft", detail } : { title: "Draft" };
-    }
     return null;
   });
 
@@ -1279,11 +1252,23 @@ export default function SessionView(props: SessionViewProps) {
 
   onMount(() => {
     const container = chatContainerEl;
-    if (!container) return;
-    const update = () => setNearBottom(isNearBottom(container));
-    update();
-    container.addEventListener("scroll", update, { passive: true });
-    onCleanup(() => container.removeEventListener("scroll", update));
+    const sentinel = bottomVisibilityEl;
+    if (!container || !sentinel) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        setNearBottom(Boolean(entry?.isIntersecting));
+      },
+      {
+        root: container,
+        rootMargin: "0px 0px 96px 0px",
+        threshold: 0,
+      },
+    );
+
+    observer.observe(sentinel);
+    onCleanup(() => observer.disconnect());
   });
 
   createEffect(
@@ -1301,9 +1286,9 @@ export default function SessionView(props: SessionViewProps) {
 
         if (!firstVisit) {
           queueMicrotask(() => {
-            const container = chatContainerEl;
-            if (!container) return;
-            setNearBottom(isNearBottom(container));
+            if (nearBottom()) {
+              scheduleScrollToLatest("auto");
+            }
           });
           return;
         }
@@ -1312,7 +1297,6 @@ export default function SessionView(props: SessionViewProps) {
           const container = chatContainerEl;
           if (!container) return;
           container.scrollTop = 0;
-          setNearBottom(isNearBottom(container));
         });
       },
     ),
@@ -1918,15 +1902,27 @@ export default function SessionView(props: SessionViewProps) {
     onCleanup(() => window.removeEventListener("mousedown", handler));
   });
 
-  const handleProviderAuthSelect = async (providerId: string) => {
+  const handleProviderAuthSelect = async (providerId: string): Promise<ProviderOAuthStartResult> => {
+    if (providerAuthActionBusy()) {
+      throw new Error("Provider auth is already in progress.");
+    }
+    setProviderAuthActionBusy(true);
+    try {
+      return await props.startProviderAuth(providerId);
+    } finally {
+      setProviderAuthActionBusy(false);
+    }
+  };
+
+  const handleProviderAuthOAuth = async (providerId: string, methodIndex: number, code?: string) => {
     if (providerAuthActionBusy()) return;
     setProviderAuthActionBusy(true);
     try {
-      const message = await props.startProviderAuth(providerId);
-      setToastMessage(message || "Auth flow started");
+      const message = await props.completeProviderAuthOAuth(providerId, methodIndex, code);
+      setToastMessage(message || "Provider connected");
       props.closeProviderAuthModal();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Auth failed";
+      const message = error instanceof Error ? error.message : "OAuth failed";
       setToastMessage(message);
     } finally {
       setProviderAuthActionBusy(false);
@@ -1974,6 +1970,23 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   const [shareLocalOpenworkWorkspaceId, setShareLocalOpenworkWorkspaceId] = createSignal<string | null>(null);
+  const [shareWorkspaceProfileBusy, setShareWorkspaceProfileBusy] = createSignal(false);
+  const [shareWorkspaceProfileUrl, setShareWorkspaceProfileUrl] = createSignal<string | null>(null);
+  const [shareWorkspaceProfileError, setShareWorkspaceProfileError] = createSignal<string | null>(null);
+  const [shareSkillsSetBusy, setShareSkillsSetBusy] = createSignal(false);
+  const [shareSkillsSetUrl, setShareSkillsSetUrl] = createSignal<string | null>(null);
+  const [shareSkillsSetError, setShareSkillsSetError] = createSignal<string | null>(null);
+
+  createEffect(
+    on(shareWorkspaceId, () => {
+      setShareWorkspaceProfileBusy(false);
+      setShareWorkspaceProfileUrl(null);
+      setShareWorkspaceProfileError(null);
+      setShareSkillsSetBusy(false);
+      setShareSkillsSetUrl(null);
+      setShareSkillsSetError(null);
+    }),
+  );
 
   createEffect(() => {
     const ws = shareWorkspace();
@@ -2032,7 +2045,18 @@ export default function SessionView(props: SessionViewProps) {
         : null;
       const url = mountedUrl || hostUrl;
       const token = props.openworkServerHostInfo?.clientToken?.trim() || "";
+      const inviteUrl = buildOpenworkConnectInviteUrl({
+        workspaceUrl: url,
+        token,
+      });
       return [
+        {
+          label: "OpenWork invite link",
+          value: inviteUrl,
+          secret: true,
+          placeholder: !isTauriRuntime() ? "Desktop app required" : "Starting server...",
+          hint: "One link that prefills worker URL and token.",
+        },
         {
           label: "OpenWork worker URL",
           value: url,
@@ -2062,7 +2086,17 @@ export default function SessionView(props: SessionViewProps) {
         ws.openworkToken?.trim() ||
         props.openworkServerSettings.token?.trim() ||
         "";
+      const inviteUrl = buildOpenworkConnectInviteUrl({
+        workspaceUrl: url,
+        token,
+      });
       return [
+        {
+          label: "OpenWork invite link",
+          value: inviteUrl,
+          secret: true,
+          hint: "One link that prefills worker URL and token.",
+        },
         {
           label: "OpenWork worker URL",
           value: url,
@@ -2100,6 +2134,188 @@ export default function SessionView(props: SessionViewProps) {
     }
     return null;
   });
+
+  const shareServiceDisabledReason = createMemo(() => {
+    const ws = shareWorkspace();
+    if (!ws) return "Select a worker first.";
+    if (ws.workspaceType === "remote" && ws.remoteType !== "openwork") {
+      return "Share service links are available for OpenWork workers.";
+    }
+    if (ws.workspaceType !== "remote") {
+      const baseUrl = props.openworkServerHostInfo?.baseUrl?.trim() ?? "";
+      const token = props.openworkServerHostInfo?.clientToken?.trim() ?? "";
+      if (!baseUrl || !token) {
+        return "Local OpenWork host is not ready yet.";
+      }
+    } else {
+      const hostUrl = ws.openworkHostUrl?.trim() || ws.baseUrl?.trim() || "";
+      const token = ws.openworkToken?.trim() || props.openworkServerSettings.token?.trim() || "";
+      if (!hostUrl) return "Missing OpenWork host URL.";
+      if (!token) return "Missing OpenWork token.";
+    }
+    return null;
+  });
+
+  const resolveShareExportContext = async (): Promise<{
+    client: OpenworkServerClient;
+    workspaceId: string;
+    workspace: WorkspaceInfo;
+  }> => {
+    const ws = shareWorkspace();
+    if (!ws) {
+      throw new Error("Select a worker first.");
+    }
+
+    if (ws.workspaceType !== "remote") {
+      const baseUrl = props.openworkServerHostInfo?.baseUrl?.trim() ?? "";
+      const token = props.openworkServerHostInfo?.clientToken?.trim() ?? "";
+      if (!baseUrl || !token) {
+        throw new Error("Local OpenWork host is not ready yet.");
+      }
+      const client = createOpenworkServerClient({ baseUrl, token });
+
+      let workspaceId = shareLocalOpenworkWorkspaceId()?.trim() ?? "";
+      if (!workspaceId) {
+        const response = await client.listWorkspaces();
+        const items = Array.isArray(response.items) ? response.items : [];
+        const targetPath = normalizeDirectoryPath(ws.path?.trim() ?? "");
+        const match = items.find((entry) => normalizeDirectoryPath(entry.path) === targetPath);
+        workspaceId = (match?.id ?? "").trim();
+        setShareLocalOpenworkWorkspaceId(workspaceId || null);
+      }
+
+      if (!workspaceId) {
+        throw new Error("Could not resolve this worker on the local OpenWork host.");
+      }
+
+      return { client, workspaceId, workspace: ws };
+    }
+
+    if (ws.remoteType !== "openwork") {
+      throw new Error("Share service links are available for OpenWork workers.");
+    }
+
+    const hostUrl = ws.openworkHostUrl?.trim() || ws.baseUrl?.trim() || "";
+    const token = ws.openworkToken?.trim() || props.openworkServerSettings.token?.trim() || "";
+    if (!hostUrl || !token) {
+      throw new Error("OpenWork host URL and token are required.");
+    }
+
+    const client = createOpenworkServerClient({ baseUrl: hostUrl, token });
+    let workspaceId =
+      ws.openworkWorkspaceId?.trim() ||
+      parseOpenworkWorkspaceIdFromUrl(ws.openworkHostUrl ?? "") ||
+      parseOpenworkWorkspaceIdFromUrl(ws.baseUrl ?? "") ||
+      "";
+
+    if (!workspaceId) {
+      const response = await client.listWorkspaces();
+      const items = Array.isArray(response.items) ? response.items : [];
+      const directoryHint = normalizeDirectoryPath(ws.directory?.trim() ?? ws.path?.trim() ?? "");
+      const match = directoryHint
+        ? items.find((entry) => {
+            const entryPath = normalizeDirectoryPath(
+              (entry.opencode?.directory ?? entry.directory ?? entry.path ?? "").trim(),
+            );
+            return Boolean(entryPath && entryPath === directoryHint);
+          })
+        : (response.activeId ? items.find((entry) => entry.id === response.activeId) : null) ??
+          items[0];
+      workspaceId = (match?.id ?? "").trim();
+    }
+
+    if (!workspaceId) {
+      throw new Error("Could not resolve this worker on the OpenWork host.");
+    }
+
+    return { client, workspaceId, workspace: ws };
+  };
+
+  const publishWorkspaceProfileLink = async () => {
+    if (shareWorkspaceProfileBusy()) return;
+    setShareWorkspaceProfileBusy(true);
+    setShareWorkspaceProfileError(null);
+    setShareWorkspaceProfileUrl(null);
+
+    try {
+      const { client, workspaceId, workspace } = await resolveShareExportContext();
+      const exported = await client.exportWorkspace(workspaceId);
+      const payload: WorkspaceProfileBundleV1 = {
+        schemaVersion: 1,
+        type: "workspace-profile",
+        name: `${workspaceLabel(workspace)} profile`,
+        description: "Full OpenWork workspace profile with config, MCP setup, commands, and skills.",
+        workspace: exported,
+      };
+
+      const result = await publishOpenworkBundleJson({
+        payload,
+        bundleType: "workspace-profile",
+        name: payload.name,
+      });
+
+      setShareWorkspaceProfileUrl(result.url);
+      try {
+        await navigator.clipboard.writeText(result.url);
+      } catch {
+        // ignore
+      }
+    } catch (error) {
+      setShareWorkspaceProfileError(error instanceof Error ? error.message : "Failed to publish workspace profile");
+    } finally {
+      setShareWorkspaceProfileBusy(false);
+    }
+  };
+
+  const publishSkillsSetLink = async () => {
+    if (shareSkillsSetBusy()) return;
+    setShareSkillsSetBusy(true);
+    setShareSkillsSetError(null);
+    setShareSkillsSetUrl(null);
+
+    try {
+      const { client, workspaceId, workspace } = await resolveShareExportContext();
+      const exported = await client.exportWorkspace(workspaceId);
+      const skills = Array.isArray(exported.skills) ? exported.skills : [];
+      if (!skills.length) {
+        throw new Error("No skills found in this workspace.");
+      }
+
+      const payload: SkillsSetBundleV1 = {
+        schemaVersion: 1,
+        type: "skills-set",
+        name: `${workspaceLabel(workspace)} skills`,
+        description: "Complete skills set from an OpenWork workspace.",
+        skills: skills.map((skill) => ({
+          name: skill.name,
+          description: skill.description,
+          trigger: skill.trigger,
+          content: skill.content,
+        })),
+        sourceWorkspace: {
+          id: workspaceId,
+          name: workspaceLabel(workspace),
+        },
+      };
+
+      const result = await publishOpenworkBundleJson({
+        payload,
+        bundleType: "skills-set",
+        name: payload.name,
+      });
+
+      setShareSkillsSetUrl(result.url);
+      try {
+        await navigator.clipboard.writeText(result.url);
+      } catch {
+        // ignore
+      }
+    } catch (error) {
+      setShareSkillsSetError(error instanceof Error ? error.message : "Failed to publish skills set");
+    } finally {
+      setShareSkillsSetBusy(false);
+    }
+  };
 
   const exportDisabledReason = createMemo(() => {
     const ws = shareWorkspace();
@@ -2254,6 +2470,19 @@ export default function SessionView(props: SessionViewProps) {
   const commandPaletteRootItems = createMemo<CommandPaletteItem[]>(() => {
     const items: CommandPaletteItem[] = [
       {
+        id: "new-session",
+        title: "Create new session",
+        detail: "Start a fresh task in the current worker",
+        meta: "Create",
+        action: () => {
+          closeCommandPalette();
+          void Promise.resolve(props.createSessionAndOpen()).catch((error) => {
+            const message = error instanceof Error ? error.message : "Failed to create session";
+            setToastMessage(message);
+          });
+        },
+      },
+      {
         id: "sessions",
         title: "Search sessions",
         detail: `${totalSessionCount().toLocaleString()} available across workers`,
@@ -2273,6 +2502,19 @@ export default function SessionView(props: SessionViewProps) {
         action: () => {
           closeCommandPalette();
           props.openSessionModelPicker();
+        },
+      },
+      {
+        id: "provider",
+        title: "Connect provider",
+        detail: "Open provider connection flow",
+        meta: "Open",
+        action: () => {
+          closeCommandPalette();
+          void props.openProviderAuthModal().catch((error) => {
+            const message = error instanceof Error ? error.message : "Failed to load providers";
+            setToastMessage(message);
+          });
         },
       },
       {
@@ -3122,6 +3364,7 @@ export default function SessionView(props: SessionViewProps) {
          <div class="flex-1 min-w-0 relative overflow-hidden">
            <div
              class="h-full overflow-y-auto px-12 py-10 scroll-smooth bg-dls-surface"
+             style={{ contain: "layout paint style" }}
              ref={(el) => (chatContainerEl = el)}
            >
              <div class="max-w-5xl mx-auto w-full">
@@ -3188,8 +3431,10 @@ export default function SessionView(props: SessionViewProps) {
             workspaceRoot={props.activeWorkspaceRoot}
             expandedStepIds={props.expandedStepIds}
             setExpandedStepIds={props.setExpandedStepIds}
+            openSessionById={(sessionId) => props.setView("session", sessionId)}
             searchMatchMessageIds={searchMatchMessageIds()}
             activeSearchMessageId={activeSearchHit()?.messageId ?? null}
+            searchHighlightQuery={searchQueryDebounced().trim()}
             footer={
               showRunIndicator() ? (
                 <div class="flex justify-start pl-2">
@@ -3209,20 +3454,18 @@ export default function SessionView(props: SessionViewProps) {
                         <span class="text-[10px] text-gray-8 ml-auto shrink-0">{runElapsedLabel()}</span>
                       </Show>
                     </div>
-                    <Show when={thinkingDetail()?.detail}>
-                      {(detail) => (
-                        <div class="pl-3 pr-2 pt-0.5 text-[11px] leading-relaxed text-gray-10 whitespace-pre-wrap break-words">
-                          {thinkingDetail()?.title === "Reasoning" ? detail() : `${thinkingDetail()?.title}: ${detail()}`}
-                        </div>
-                      )}
-                    </Show>
                   </div>
                 </div>
               ) : undefined
             }
           />
 
-           <div ref={(el) => (messagesEndEl = el)} />
+           <div
+             ref={(el) => {
+               messagesEndEl = el;
+               bottomVisibilityEl = el;
+             }}
+           />
            </div>
            </div>
 
@@ -3585,6 +3828,7 @@ export default function SessionView(props: SessionViewProps) {
         authMethods={props.providerAuthMethods}
         onSelect={handleProviderAuthSelect}
         onSubmitApiKey={handleProviderAuthApiKey}
+        onSubmitOAuth={handleProviderAuthOAuth}
         onClose={props.closeProviderAuthModal}
       />
 
@@ -3620,6 +3864,17 @@ export default function SessionView(props: SessionViewProps) {
         workspaceDetail={shareWorkspaceDetail()}
         fields={shareFields()}
         note={shareNote()}
+        publisherBaseUrl={DEFAULT_OPENWORK_PUBLISHER_BASE_URL}
+        onShareWorkspaceProfile={publishWorkspaceProfileLink}
+        shareWorkspaceProfileBusy={shareWorkspaceProfileBusy()}
+        shareWorkspaceProfileUrl={shareWorkspaceProfileUrl()}
+        shareWorkspaceProfileError={shareWorkspaceProfileError()}
+        shareWorkspaceProfileDisabledReason={shareServiceDisabledReason()}
+        onShareSkillsSet={publishSkillsSetLink}
+        shareSkillsSetBusy={shareSkillsSetBusy()}
+        shareSkillsSetUrl={shareSkillsSetUrl()}
+        shareSkillsSetError={shareSkillsSetError()}
+        shareSkillsSetDisabledReason={shareServiceDisabledReason()}
         onExportConfig={
           exportDisabledReason()
             ? undefined

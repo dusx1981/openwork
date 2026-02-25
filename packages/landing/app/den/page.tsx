@@ -11,7 +11,6 @@ export const metadata = {
 
 export default async function Den() {
   const github = await getGithubData();
-  const checkoutUrl = process.env.NEXT_PUBLIC_DEN_CHECKOUT_URL ?? "";
 
   return (
     <div className="min-h-screen">
@@ -35,42 +34,36 @@ export default async function Den() {
           </div>
 
           <div className="mb-12 mt-10 flex flex-wrap items-center gap-3">
-            {checkoutUrl ? (
-              <a
-                href={checkoutUrl}
-                className="doc-button"
-                rel="noreferrer"
-                target="_blank"
+            <a
+              href="https://app.openwork.software"
+              className="doc-button"
+              rel="noreferrer"
+              target="_blank"
+            >
+              Get started
+              <svg
+                className="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
               >
-                Start Den preorder
-                <svg
-                  className="h-4 w-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="2"
-                    d="M14 5l7 7m0 0l-7 7m7-7H3"
-                  />
-                </svg>
-              </a>
-            ) : (
-              <a href="/enterprise#book" className="doc-button">
-                Book onboarding
-              </a>
-            )}
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  d="M14 5l7 7m0 0l-7 7m7-7H3"
+                />
+              </svg>
+            </a>
           </div>
 
           <div className="mb-8 text-[20px] font-semibold text-black">
             $1 first month, then $50/month per worker. Cancel anytime.
           </div>
           <p className="mb-12 max-w-3xl text-[15px] leading-relaxed text-gray-600">
-            Preorder includes priority onboarding, custom workflow setup, and
-            Den access when hosted rollout drops by Feb 24.
+            Early adopters get priority onboarding and custom workflow setup
+            through March 1.
           </p>
 
           <div className="mb-14 grid grid-cols-1 gap-6 sm:grid-cols-2 md:grid-cols-3">

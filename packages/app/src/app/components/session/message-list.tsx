@@ -15,8 +15,10 @@ export type MessageListProps = {
   showThinking: boolean;
   expandedStepIds: Set<string>;
   setExpandedStepIds: (updater: (current: Set<string>) => Set<string>) => void;
+  openSessionById?: (sessionId: string) => void;
   searchMatchMessageIds?: ReadonlySet<string>;
   activeSearchMessageId?: string | null;
+  searchHighlightQuery?: string;
   workspaceRoot?: string;
   footer?: JSX.Element;
 };
@@ -95,6 +97,45 @@ function latestStepPart(partsGroups: Part[][]): Part | undefined {
   return undefined;
 }
 
+type TaskStepInfo = {
+  isTask: boolean;
+  agentType?: string;
+  sessionId?: string;
+};
+
+function formatAgentType(agentType: string): string {
+  const clean = agentType.trim().replace(/[_-]+/g, " ");
+  if (!clean) return "";
+  return clean
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
+function getTaskStepInfo(part: Part): TaskStepInfo {
+  if (part.type !== "tool") return { isTask: false };
+
+  const record = part as any;
+  const tool = typeof record.tool === "string" ? record.tool.toLowerCase() : "";
+  if (tool !== "task") return { isTask: false };
+
+  const state = record.state ?? {};
+  const input = state.input && typeof state.input === "object" ? (state.input as Record<string, unknown>) : {};
+  const metadata = state.metadata && typeof state.metadata === "object" ? (state.metadata as Record<string, unknown>) : {};
+
+  const rawAgentType = typeof input.subagent_type === "string" ? input.subagent_type.trim() : "";
+  const agentType = rawAgentType ? formatAgentType(rawAgentType) : undefined;
+  const rawSessionId =
+    metadata.sessionId ??
+    metadata.sessionID ??
+    state.sessionId ??
+    state.sessionID;
+  const sessionId = typeof rawSessionId === "string" && rawSessionId.trim() ? rawSessionId.trim() : undefined;
+
+  return { isTask: true, agentType, sessionId };
+}
+
 export default function MessageList(props: MessageListProps) {
   const [copyingId, setCopyingId] = createSignal<string | null>(null);
   let previousMessagePartCountById = new Map<string, number>();
@@ -117,7 +158,6 @@ export default function MessageList(props: MessageListProps) {
       })
       .filter((attachment) => !!attachment.url);
   const isImageAttachment = (mime: string) => mime.startsWith("image/");
-
   onCleanup(() => {
     if (copyTimeout !== undefined) {
       window.clearTimeout(copyTimeout);
@@ -178,7 +218,7 @@ export default function MessageList(props: MessageListProps) {
   const renderablePartsForMessage = (message: MessageWithParts) =>
     message.parts.filter((part) => {
       if (part.type === "reasoning") {
-        return props.developerMode && props.showThinking;
+        return props.showThinking;
       }
 
       if (part.type === "step-start" || part.type === "step-finish") {
@@ -221,25 +261,18 @@ export default function MessageList(props: MessageListProps) {
       const groups = groupMessageParts(renderableParts, groupId);
       const isUser = (message.info as any).role === "user";
       const isStepsOnly = groups.length > 0 && groups.every((group) => group.kind === "steps");
-      const stepGroups = isStepsOnly ? (groups as { kind: "steps"; id: string; parts: Part[] }[]) : [];
+      const stepGroups = isStepsOnly ? (groups as { kind: "steps"; id: string; parts: Part[]; segment: "execution" }[]) : [];
       stepGroupCount += groups.reduce((count, group) => (group.kind === "steps" ? count + 1 : count), 0);
 
       if (isStepsOnly) {
-        const lastBlock = blocks[blocks.length - 1];
-        if (lastBlock && lastBlock.kind === "steps-cluster" && lastBlock.isUser === isUser) {
-          lastBlock.partsGroups.push(...stepGroups.map((group) => group.parts));
-          lastBlock.stepIds.push(...stepGroups.map((group) => group.id));
-          lastBlock.messageIds.push(messageId);
-        } else {
-          blocks.push({
-            kind: "steps-cluster",
-            id: stepGroups[0].id,
-            stepIds: stepGroups.map((group) => group.id),
-            partsGroups: stepGroups.map((group) => group.parts),
-            messageIds: [messageId],
-            isUser,
-          });
-        }
+        blocks.push({
+          kind: "steps-cluster",
+          id: stepGroups[0].id,
+          stepIds: stepGroups.map((group) => group.id),
+          partsGroups: stepGroups.map((group) => group.parts),
+          messageIds: [messageId],
+          isUser,
+        });
         return;
       }
 
@@ -296,11 +329,40 @@ export default function MessageList(props: MessageListProps) {
     return "";
   });
 
+  const shouldUseContentVisibility = createMemo(() => messageBlocks().length > 80);
+  const blockPerfStyle = (index: number): JSX.CSSProperties | undefined => {
+    if (!shouldUseContentVisibility()) return undefined;
+    const total = messageBlocks().length;
+    if (index >= total - 24) return undefined;
+    return {
+      "content-visibility": "auto",
+      "contain-intrinsic-size": "220px",
+    };
+  };
+
   /** Compact single-line step row */
   const StepRow = (rowProps: { part: Part; isUser: boolean }) => {
     const summary = createMemo(() => summarizeStep(rowProps.part));
     const category = createMemo(() => summary().toolCategory ?? "tool");
     const status = createMemo(() => summary().status);
+    const task = createMemo(() => getTaskStepInfo(rowProps.part));
+
+    if (rowProps.part.type === "reasoning") {
+      return (
+        <div class="py-2">
+          <div class="rounded-2xl border border-gray-6/60 bg-gray-2/40 px-3 py-2.5">
+            <div class="text-[12px] font-medium text-gray-12">{summary().title}</div>
+            <Show when={summary().detail}>
+              {(detail) => (
+                <p class="mt-1 text-[12px] leading-relaxed text-gray-10 whitespace-pre-wrap break-words">
+                  {detail()}
+                </p>
+              )}
+            </Show>
+          </div>
+        </div>
+      );
+    }
 
     return (
       <div class="flex items-center gap-2.5 py-1.5 min-h-[28px] group/step">
@@ -324,11 +386,38 @@ export default function MessageList(props: MessageListProps) {
             skill
           </span>
         </Show>
+        <Show when={task().isTask}>
+          <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-3 text-blue-11 shrink-0">
+            subagent
+          </span>
+        </Show>
         {/* Detail - truncated to single line */}
         <Show when={summary().detail}>
           <span class="text-[12px] text-gray-9 truncate min-w-0">
             {summary().detail}
           </span>
+        </Show>
+        <Show when={task().agentType && !summary().detail}>
+          {(agentType) => (
+            <span class="text-[12px] text-gray-9 truncate min-w-0">
+              {agentType()} agent
+            </span>
+          )}
+        </Show>
+        <Show when={Boolean(task().sessionId && props.openSessionById)}>
+          <button
+            type="button"
+            class="ml-auto text-[11px] text-blue-11 hover:text-blue-10 underline underline-offset-2"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              const sessionId = task().sessionId;
+              if (!sessionId) return;
+              props.openSessionById?.(sessionId);
+            }}
+          >
+            open
+          </button>
         </Show>
       </div>
     );
@@ -369,6 +458,31 @@ export default function MessageList(props: MessageListProps) {
     const relatedIds = () => containerProps.relatedIds ?? [];
     const expanded = () => isStepsExpanded(containerProps.id, relatedIds());
     const latestStep = () => latestStepPart(containerProps.partsGroups);
+    const toolCallCount = () =>
+      containerProps.partsGroups.reduce(
+        (sum, parts) => sum + parts.reduce((count, part) => (part.type === "tool" ? count + 1 : count), 0),
+        0,
+      );
+    const reasoningCount = () =>
+      containerProps.partsGroups.reduce(
+        (sum, parts) => sum + parts.reduce((count, part) => (part.type === "reasoning" ? count + 1 : count), 0),
+        0,
+      );
+
+    const executionSummary = () => {
+      const tools = toolCallCount();
+      const reasoning = reasoningCount();
+      if (tools > 0 && reasoning > 0) {
+        return `${tools} step${tools === 1 ? "" : "s"} with ${reasoning} thought update${reasoning === 1 ? "" : "s"}`;
+      }
+      if (tools > 0) {
+        return `${tools} step${tools === 1 ? "" : "s"}`;
+      }
+      if (reasoning > 0) {
+        return `${reasoning} thought update${reasoning === 1 ? "" : "s"}`;
+      }
+      return "updates";
+    };
 
     const compactPathToken = (value: string) => {
       const token = value
@@ -515,8 +629,16 @@ export default function MessageList(props: MessageListProps) {
             <Show when={hasRunning()}>
               <span class="inline-flex h-1 w-1 rounded-full bg-blue-10/70 animate-pulse" />
             </Show>
-            <span class="truncate max-w-[58ch]">{latestStepLabel()}</span>
+            <span class="truncate max-w-[58ch]">
+              {expanded() ? "Hide timeline" : "Execution timeline"}
+            </span>
           </span>
+          <Show when={!expanded()}>
+            <span class="text-[11px] text-gray-9 truncate max-w-[42ch]">{`${executionSummary()} - ${latestStepLabel()}`}</span>
+          </Show>
+          <Show when={expanded()}>
+            <span class="text-[11px] text-gray-9 truncate max-w-[42ch]">{executionSummary()}</span>
+          </Show>
         </button>
 
         {/* Expanded content */}
@@ -548,9 +670,9 @@ export default function MessageList(props: MessageListProps) {
   };
 
   return (
-    <div class="space-y-6 pb-32">
+    <div class="space-y-6 pb-32" style={{ contain: "layout paint style" }}>
       <For each={messageBlocks()}>
-        {(block) => {
+        {(block, blockIndex) => {
           const blockMessageIds = block.kind === "steps-cluster" ? block.messageIds : [block.messageId];
           const hasSearchMatch = blockMessageIds.some((id) => props.searchMatchMessageIds?.has(id));
           const hasActiveSearchMatch = blockMessageIds.some((id) => id === props.activeSearchMessageId);
@@ -566,6 +688,7 @@ export default function MessageList(props: MessageListProps) {
                 class={`flex group ${block.isUser ? "justify-end" : "justify-start"}`.trim()}
                 data-message-role={block.isUser ? "user" : "assistant"}
                 data-message-id={block.messageIds[0] ?? ""}
+                style={blockPerfStyle(blockIndex())}
               >
                 <div
                   class={`w-full relative ${
@@ -591,6 +714,7 @@ export default function MessageList(props: MessageListProps) {
               class={`flex group ${block.isUser ? "justify-end" : "justify-start"}`.trim()}
               data-message-role={block.isUser ? "user" : "assistant"}
               data-message-id={block.messageId}
+              style={blockPerfStyle(blockIndex())}
             >
               <div
                 class={`w-full relative ${
@@ -635,20 +759,21 @@ export default function MessageList(props: MessageListProps) {
                           const markdownThrottleMs = isStreamingLatestAssistant ? 550 : 100;
                           return (
                             <PartView
-                              part={(group as { kind: "text"; part: Part }).part}
+                              part={(group as { kind: "text"; part: Part; segment: "intent" | "result" }).part}
                               developerMode={props.developerMode}
                               showThinking={props.showThinking}
                               workspaceRoot={props.workspaceRoot}
                               tone={block.isUser ? "dark" : "light"}
                               renderMarkdown={!block.isUser}
                               markdownThrottleMs={markdownThrottleMs}
+                              highlightQuery={hasSearchMatch ? props.searchHighlightQuery : undefined}
                             />
                           );
                         })()}
                       </Show>
                       {group.kind === "steps" &&
                         (() => {
-                          const stepGroup = group as { kind: "steps"; id: string; parts: Part[] };
+                          const stepGroup = group as { kind: "steps"; id: string; parts: Part[]; segment: "execution" };
                           return (
                             <StepsContainer
                               id={stepGroup.id}

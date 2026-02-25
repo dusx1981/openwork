@@ -1,15 +1,17 @@
 import { randomBytes, randomUUID } from "crypto"
 import express from "express"
 import { fromNodeHeaders } from "better-auth/node"
-import { and, desc, eq } from "drizzle-orm"
+import { and, asc, desc, eq, isNull } from "drizzle-orm"
 import { z } from "zod"
 import { auth } from "../auth.js"
 import { requireCloudWorkerAccess } from "../billing/polar.js"
 import { db } from "../db/index.js"
-import { OrgMembershipTable, WorkerInstanceTable, WorkerTable, WorkerTokenTable } from "../db/schema.js"
+import { AuditEventTable, OrgMembershipTable, WorkerBundleTable, WorkerInstanceTable, WorkerTable, WorkerTokenTable } from "../db/schema.js"
 import { env } from "../env.js"
+import { asyncRoute, isTransientDbConnectionError } from "./errors.js"
 import { ensureDefaultOrg } from "../orgs.js"
-import { provisionWorker } from "../workers/provisioner.js"
+import { deprovisionWorker, provisionWorker } from "../workers/provisioner.js"
+import { customDomainForWorker } from "../workers/vanity-domain.js"
 
 const createSchema = z.object({
   name: z.string().min(1),
@@ -28,6 +30,100 @@ const token = () => randomBytes(32).toString("hex")
 
 type WorkerRow = typeof WorkerTable.$inferSelect
 type WorkerInstanceRow = typeof WorkerInstanceTable.$inferSelect
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function normalizeUrl(value: string): string {
+  return value.trim().replace(/\/+$/, "")
+}
+
+function parseWorkspaceSelection(payload: unknown): { workspaceId: string; openworkUrl: string } | null {
+  if (!isRecord(payload) || !Array.isArray(payload.items)) {
+    return null
+  }
+
+  const activeId = typeof payload.activeId === "string" ? payload.activeId : null
+  let workspaceId = activeId
+
+  if (!workspaceId) {
+    for (const item of payload.items) {
+      if (isRecord(item) && typeof item.id === "string" && item.id.trim()) {
+        workspaceId = item.id
+        break
+      }
+    }
+  }
+
+  const baseUrl = typeof payload.baseUrl === "string" ? normalizeUrl(payload.baseUrl) : ""
+  if (!workspaceId || !baseUrl) {
+    return null
+  }
+
+  return {
+    workspaceId,
+    openworkUrl: `${baseUrl}/w/${encodeURIComponent(workspaceId)}`,
+  }
+}
+
+async function resolveConnectUrlFromWorker(instanceUrl: string, clientToken: string) {
+  const baseUrl = normalizeUrl(instanceUrl)
+  if (!baseUrl || !clientToken.trim()) {
+    return null
+  }
+
+  try {
+    const response = await fetch(`${baseUrl}/workspaces`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${clientToken.trim()}`,
+      },
+    })
+
+    if (!response.ok) {
+      return null
+    }
+
+    const payload = (await response.json()) as unknown
+    const selected = parseWorkspaceSelection({
+      ...(isRecord(payload) ? payload : {}),
+      baseUrl,
+    })
+    return selected
+  } catch {
+    return null
+  }
+}
+
+function getConnectUrlCandidates(workerId: string, instanceUrl: string | null) {
+  const candidates: string[] = []
+  const vanityHostname = customDomainForWorker(workerId, env.render.workerPublicDomainSuffix)
+  if (vanityHostname) {
+    candidates.push(`https://${vanityHostname}`)
+  }
+
+  if (instanceUrl) {
+    const normalized = normalizeUrl(instanceUrl)
+    if (normalized && !candidates.includes(normalized)) {
+      candidates.push(normalized)
+    }
+  }
+
+  return candidates
+}
+
+async function resolveConnectUrlFromCandidates(workerId: string, instanceUrl: string | null, clientToken: string) {
+  const candidates = getConnectUrlCandidates(workerId, instanceUrl)
+  for (const candidate of candidates) {
+    const resolved = await resolveConnectUrlFromWorker(candidate, clientToken)
+    if (resolved) {
+      return resolved
+    }
+  }
+  return null
+}
 
 async function requireSession(req: express.Request, res: express.Response) {
   const session = await auth.api.getSession({
@@ -53,14 +149,32 @@ async function getOrgId(userId: string) {
 }
 
 async function getLatestWorkerInstance(workerId: string) {
-  const rows = await db
-    .select()
-    .from(WorkerInstanceTable)
-    .where(eq(WorkerInstanceTable.worker_id, workerId))
-    .orderBy(desc(WorkerInstanceTable.created_at))
-    .limit(1)
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const rows = await db
+        .select()
+        .from(WorkerInstanceTable)
+        .where(eq(WorkerInstanceTable.worker_id, workerId))
+        .orderBy(desc(WorkerInstanceTable.created_at))
+        .limit(1)
 
-  return rows[0] ?? null
+      return rows[0] ?? null
+    } catch (error) {
+      if (!isTransientDbConnectionError(error)) {
+        throw error
+      }
+
+      if (attempt === 0) {
+        console.warn(`[workers] transient db error reading instance for ${workerId}; retrying`)
+        continue
+      }
+
+      console.warn(`[workers] transient db error reading instance for ${workerId}; returning null instance`)
+      return null
+    }
+  }
+
+  return null
 }
 
 function toInstanceResponse(instance: WorkerInstanceRow | null) {
@@ -96,9 +210,42 @@ function toWorkerResponse(row: WorkerRow, userId: string) {
   }
 }
 
+async function continueCloudProvisioning(input: { workerId: string; name: string; hostToken: string; clientToken: string }) {
+  try {
+    const provisioned = await provisionWorker({
+      workerId: input.workerId,
+      name: input.name,
+      hostToken: input.hostToken,
+      clientToken: input.clientToken,
+    })
+
+    await db
+      .update(WorkerTable)
+      .set({ status: provisioned.status })
+      .where(eq(WorkerTable.id, input.workerId))
+
+    await db.insert(WorkerInstanceTable).values({
+      id: randomUUID(),
+      worker_id: input.workerId,
+      provider: provisioned.provider,
+      region: provisioned.region,
+      url: provisioned.url,
+      status: provisioned.status,
+    })
+  } catch (error) {
+    await db
+      .update(WorkerTable)
+      .set({ status: "failed" })
+      .where(eq(WorkerTable.id, input.workerId))
+
+    const message = error instanceof Error ? error.message : "provisioning_failed"
+    console.error(`[workers] provisioning failed for ${input.workerId}: ${message}`)
+  }
+}
+
 export const workersRouter = express.Router()
 
-workersRouter.get("/", async (req, res) => {
+workersRouter.get("/", asyncRoute(async (req, res) => {
   const session = await requireSession(req, res)
   if (!session) return
 
@@ -132,9 +279,9 @@ workersRouter.get("/", async (req, res) => {
   )
 
   res.json({ workers })
-})
+}))
 
-workersRouter.post("/", async (req, res) => {
+workersRouter.post("/", asyncRoute(async (req, res) => {
   const session = await requireSession(req, res)
   if (!session) return
 
@@ -205,44 +352,16 @@ workersRouter.post("/", async (req, res) => {
     },
   ])
 
-  let instance = null
   if (parsed.data.destination === "cloud") {
-    try {
-      const provisioned = await provisionWorker({
-        workerId,
-        name: parsed.data.name,
-        hostToken,
-        clientToken,
-      })
-      workerStatus = provisioned.status
-
-      await db
-        .update(WorkerTable)
-        .set({ status: workerStatus })
-        .where(eq(WorkerTable.id, workerId))
-
-      await db.insert(WorkerInstanceTable).values({
-        id: randomUUID(),
-        worker_id: workerId,
-        provider: provisioned.provider,
-        region: provisioned.region,
-        url: provisioned.url,
-        status: provisioned.status,
-      })
-      instance = provisioned
-    } catch (error) {
-      await db
-        .update(WorkerTable)
-        .set({ status: "failed" })
-        .where(eq(WorkerTable.id, workerId))
-
-      const message = error instanceof Error ? error.message : "provisioning_failed"
-      res.status(502).json({ error: "provisioning_failed", message })
-      return
-    }
+    void continueCloudProvisioning({
+      workerId,
+      name: parsed.data.name,
+      hostToken,
+      clientToken,
+    })
   }
 
-  res.status(201).json({
+  res.status(parsed.data.destination === "cloud" ? 202 : 201).json({
     worker: toWorkerResponse(
       {
         id: workerId,
@@ -264,11 +383,12 @@ workersRouter.post("/", async (req, res) => {
       host: hostToken,
       client: clientToken,
     },
-    instance,
+    instance: null,
+    launch: parsed.data.destination === "cloud" ? { mode: "async", pollAfterMs: 5000 } : { mode: "instant", pollAfterMs: 0 },
   })
-})
+}))
 
-workersRouter.get("/:id", async (req, res) => {
+workersRouter.get("/:id", asyncRoute(async (req, res) => {
   const session = await requireSession(req, res)
   if (!session) return
 
@@ -295,9 +415,9 @@ workersRouter.get("/:id", async (req, res) => {
     worker: toWorkerResponse(rows[0], session.user.id),
     instance: toInstanceResponse(instance),
   })
-})
+}))
 
-workersRouter.post("/:id/tokens", async (req, res) => {
+workersRouter.post("/:id/tokens", asyncRoute(async (req, res) => {
   const session = await requireSession(req, res)
   if (!session) return
 
@@ -318,27 +438,78 @@ workersRouter.post("/:id/tokens", async (req, res) => {
     return
   }
 
-  const hostToken = token()
-  const clientToken = token()
-  await db.insert(WorkerTokenTable).values([
-    {
-      id: randomUUID(),
-      worker_id: rows[0].id,
-      scope: "host",
-      token: hostToken,
-    },
-    {
-      id: randomUUID(),
-      worker_id: rows[0].id,
-      scope: "client",
-      token: clientToken,
-    },
-  ])
+  const tokenRows = await db
+    .select()
+    .from(WorkerTokenTable)
+    .where(and(eq(WorkerTokenTable.worker_id, rows[0].id), isNull(WorkerTokenTable.revoked_at)))
+    .orderBy(asc(WorkerTokenTable.created_at))
+
+  const hostToken = tokenRows.find((entry) => entry.scope === "host")?.token ?? null
+  const clientToken = tokenRows.find((entry) => entry.scope === "client")?.token ?? null
+
+  if (!hostToken || !clientToken) {
+    res.status(409).json({
+      error: "worker_tokens_unavailable",
+      message: "Worker tokens are missing for this worker. Launch a new worker and try again.",
+    })
+    return
+  }
+
+  const instance = await getLatestWorkerInstance(rows[0].id)
+  const connect = await resolveConnectUrlFromCandidates(rows[0].id, instance?.url ?? null, clientToken)
 
   res.json({
     tokens: {
       host: hostToken,
       client: clientToken,
     },
+    connect: connect ?? (instance?.url ? { openworkUrl: instance.url, workspaceId: null } : null),
   })
-})
+}))
+
+workersRouter.delete("/:id", asyncRoute(async (req, res) => {
+  const session = await requireSession(req, res)
+  if (!session) return
+
+  const orgId = await getOrgId(session.user.id)
+  if (!orgId) {
+    res.status(404).json({ error: "worker_not_found" })
+    return
+  }
+
+  const rows = await db
+    .select()
+    .from(WorkerTable)
+    .where(and(eq(WorkerTable.id, req.params.id), eq(WorkerTable.org_id, orgId)))
+    .limit(1)
+
+  if (rows.length === 0) {
+    res.status(404).json({ error: "worker_not_found" })
+    return
+  }
+
+  const worker = rows[0]
+  const instance = await getLatestWorkerInstance(worker.id)
+
+  if (worker.destination === "cloud") {
+    try {
+      await deprovisionWorker({
+        workerId: worker.id,
+        instanceUrl: instance?.url ?? null,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "deprovision_failed"
+      console.warn(`[workers] deprovision warning for ${worker.id}: ${message}`)
+    }
+  }
+
+  await db.transaction(async (tx) => {
+    await tx.delete(WorkerTokenTable).where(eq(WorkerTokenTable.worker_id, worker.id))
+    await tx.delete(WorkerInstanceTable).where(eq(WorkerInstanceTable.worker_id, worker.id))
+    await tx.delete(WorkerBundleTable).where(eq(WorkerBundleTable.worker_id, worker.id))
+    await tx.delete(AuditEventTable).where(eq(AuditEventTable.worker_id, worker.id))
+    await tx.delete(WorkerTable).where(eq(WorkerTable.id, worker.id))
+  })
+
+  res.status(204).end()
+}))

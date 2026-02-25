@@ -502,17 +502,28 @@ export function groupMessageParts(parts: Part[], messageId: string): MessageGrou
   const steps: Part[] = [];
   let textBuffer = "";
   let stepGroupIndex = 0;
+  let sawExecution = false;
 
   const flushText = () => {
     if (!textBuffer) return;
-    groups.push({ kind: "text", part: { type: "text", text: textBuffer } as Part });
+    groups.push({
+      kind: "text",
+      part: { type: "text", text: textBuffer } as Part,
+      segment: sawExecution ? "result" : "intent",
+    });
     textBuffer = "";
   };
 
   const flushSteps = () => {
     if (!steps.length) return;
-    groups.push({ kind: "steps", id: `steps-${messageId}-${stepGroupIndex}`, parts: steps.splice(0, steps.length) });
+    groups.push({
+      kind: "steps",
+      id: `steps-${messageId}-${stepGroupIndex}`,
+      parts: steps.splice(0, steps.length),
+      segment: "execution",
+    });
     stepGroupIndex += 1;
+    sawExecution = true;
   };
 
   parts.forEach((part) => {
@@ -532,7 +543,7 @@ export function groupMessageParts(parts: Part[], messageId: string): MessageGrou
     if (part.type === "file") {
       flushSteps();
       flushText();
-      groups.push({ kind: "text", part });
+      groups.push({ kind: "text", part, segment: sawExecution ? "result" : "intent" });
       return;
     }
 
@@ -582,6 +593,15 @@ function normalizeStepText(value: unknown): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function cleanReasoningText(value: string): string {
+  return value
+    .replace(/\[REDACTED\]/g, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .trim();
+}
+
 function truncateStepText(value: string, max = 80): string {
   return value.length > max ? `${value.slice(0, Math.max(0, max - 3))}...` : value;
 }
@@ -594,6 +614,16 @@ function normalizePathToken(value: string): string {
   const clean = value.trim().replace(/^[`'"([{]+|[`'"\])},.;:]+$/g, "");
   if (!isPathLike(clean)) return clean;
   return extractFilename(clean);
+}
+
+function formatAgentLabel(value: string): string {
+  const clean = value.trim().replace(/[_-]+/g, " ");
+  if (!clean) return "";
+  return clean
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ");
 }
 
 function getToolInput(state: any): Record<string, unknown> {
@@ -659,10 +689,9 @@ function buildToolTitle(state: any, toolName: string): string {
   }
 
   if (lower === "task") {
-    const description = pick("description");
-    if (description) return truncateStepText(description, 56);
-    const agent = pick("subagent_type");
-    return agent ? `Delegate ${agent}` : "Delegate task";
+    const agent = formatAgentLabel(pick("subagent_type"));
+    if (agent) return `${agent} task`;
+    return "Task";
   }
 
   if (lower === "webfetch") {
@@ -711,7 +740,9 @@ function buildToolDetail(state: any, toolName: string): string | undefined {
   }
 
   if (lower === "task") {
-    const agent = pick("subagent_type");
+    const description = pick("description");
+    if (description) return truncateStepText(description, 80);
+    const agent = formatAgentLabel(pick("subagent_type"));
     if (agent) return `${agent} agent`;
   }
 
@@ -865,9 +896,34 @@ export function summarizeStep(part: Part): { title: string; detail?: string; isS
 
   if (part.type === "reasoning") {
     const record = part as any;
-    const text = typeof record.text === "string" ? record.text.trim() : "";
-    if (!text) return { title: "Planning", toolCategory: "tool" };
-    return { title: "Thinking", toolCategory: "tool" };
+    const text = typeof record.text === "string" ? cleanReasoningText(record.text) : "";
+    if (!text) return { title: "Thinking", toolCategory: "tool" };
+
+    const lines = text
+      .split(/\r?\n/)
+      .map((line: string) => line.trim())
+      .filter(Boolean);
+    const compact = lines.join(" ");
+
+    let headline = "";
+    let detail = "";
+    if (lines.length > 1) {
+      headline = lines[0];
+      detail = lines.slice(1).join("\n");
+    } else {
+      const sentenceBreak = compact.indexOf(". ");
+      if (sentenceBreak > 18 && sentenceBreak < 120) {
+        headline = compact.slice(0, sentenceBreak + 1).trim();
+        detail = compact.slice(sentenceBreak + 2).trim();
+      } else {
+        headline = compact;
+        detail = compact;
+      }
+    }
+
+    headline = headline.replace(/^thinking[:\s-]*/i, "").trim();
+    const title = `Thinking: ${truncateStepText(headline || "reviewing context", 96)}`;
+    return { title, detail: detail || undefined, toolCategory: "tool" };
   }
 
   if (part.type === "step-start" || part.type === "step-finish") {
