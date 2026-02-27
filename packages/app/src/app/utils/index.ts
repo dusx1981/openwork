@@ -497,42 +497,67 @@ export function isStepPart(part: Part) {
   return part.type === "reasoning" || part.type === "tool";
 }
 
+const EXPLORATION_TOOL_NAMES = new Set(["read", "glob", "grep", "search", "list", "list_files"]);
+
+function isExplorationToolPart(part: Part) {
+  if (part.type !== "tool") return false;
+  const tool = typeof (part as any).tool === "string" ? String((part as any).tool).toLowerCase() : "";
+  return EXPLORATION_TOOL_NAMES.has(tool);
+}
+
 export function groupMessageParts(parts: Part[], messageId: string): MessageGroup[] {
   const groups: MessageGroup[] = [];
-  const steps: Part[] = [];
+  const explorationSteps: Part[] = [];
   let textBuffer = "";
   let stepGroupIndex = 0;
+  let sawExecution = false;
 
   const flushText = () => {
     if (!textBuffer) return;
-    groups.push({ kind: "text", part: { type: "text", text: textBuffer } as Part });
+    groups.push({
+      kind: "text",
+      part: { type: "text", text: textBuffer } as Part,
+      segment: sawExecution ? "result" : "intent",
+    });
     textBuffer = "";
   };
 
-  const flushSteps = () => {
-    if (!steps.length) return;
-    groups.push({ kind: "steps", id: `steps-${messageId}-${stepGroupIndex}`, parts: steps.splice(0, steps.length) });
+  const pushSteps = (stepParts: Part[], mode: "exploration" | "standalone") => {
+    if (!stepParts.length) return;
+    groups.push({
+      kind: "steps",
+      id: `steps-${messageId}-${stepGroupIndex}`,
+      parts: stepParts,
+      segment: "execution",
+      mode,
+    });
     stepGroupIndex += 1;
+    sawExecution = true;
+  };
+
+  const flushExplorationSteps = () => {
+    if (!explorationSteps.length) return;
+    pushSteps(explorationSteps.splice(0, explorationSteps.length), "exploration");
   };
 
   parts.forEach((part) => {
     if (part.type === "text") {
-      flushSteps();
+      flushExplorationSteps();
       textBuffer += (part as { text?: string }).text ?? "";
       return;
     }
 
     if (part.type === "agent") {
-      flushSteps();
+      flushExplorationSteps();
       const name = (part as { name?: string }).name ?? "";
       textBuffer += name ? `@${name}` : "@agent";
       return;
     }
 
     if (part.type === "file") {
-      flushSteps();
+      flushExplorationSteps();
       flushText();
-      groups.push({ kind: "text", part });
+      groups.push({ kind: "text", part, segment: sawExecution ? "result" : "intent" });
       return;
     }
 
@@ -542,16 +567,23 @@ export function groupMessageParts(parts: Part[], messageId: string): MessageGrou
 
     flushText();
 
-    if (part.type === "reasoning" && steps.length > 0) {
-      flushSteps();
+    if (isExplorationToolPart(part)) {
+      explorationSteps.push(part);
+      return;
     }
 
-    steps.push(part);
+    if (part.type === "reasoning" && explorationSteps.length > 0) {
+      explorationSteps.push(part);
+      return;
+    }
+
+    flushExplorationSteps();
+    pushSteps([part], "standalone");
   });
 
   flushText();
 
-  flushSteps();
+  flushExplorationSteps();
 
   return groups;
 }
@@ -582,6 +614,15 @@ function normalizeStepText(value: unknown): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function cleanReasoningText(value: string): string {
+  return value
+    .replace(/\[REDACTED\]/g, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .trim();
+}
+
 function truncateStepText(value: string, max = 80): string {
   return value.length > max ? `${value.slice(0, Math.max(0, max - 3))}...` : value;
 }
@@ -594,6 +635,16 @@ function normalizePathToken(value: string): string {
   const clean = value.trim().replace(/^[`'"([{]+|[`'"\])},.;:]+$/g, "");
   if (!isPathLike(clean)) return clean;
   return extractFilename(clean);
+}
+
+function formatAgentLabel(value: string): string {
+  const clean = value.trim().replace(/[_-]+/g, " ");
+  if (!clean) return "";
+  return clean
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ");
 }
 
 function getToolInput(state: any): Record<string, unknown> {
@@ -640,12 +691,12 @@ function buildToolTitle(state: any, toolName: string): string {
     return "Apply patch";
   }
 
-  if (lower === "list") {
+  if (lower === "list" || lower === "list_files") {
     const target = file("path");
     return target ? `List ${target}` : "List files";
   }
 
-  if (lower === "grep" || lower === "glob") {
+  if (lower === "grep" || lower === "glob" || lower === "search") {
     const pattern = pick("pattern", "query");
     return pattern ? `Search ${truncateStepText(pattern, 44)}` : "Search code";
   }
@@ -659,10 +710,9 @@ function buildToolTitle(state: any, toolName: string): string {
   }
 
   if (lower === "task") {
-    const description = pick("description");
-    if (description) return truncateStepText(description, 56);
-    const agent = pick("subagent_type");
-    return agent ? `Delegate ${agent}` : "Delegate task";
+    const agent = formatAgentLabel(pick("subagent_type"));
+    if (agent) return `${agent} task`;
+    return "Task";
   }
 
   if (lower === "webfetch") {
@@ -705,13 +755,15 @@ function buildToolDetail(state: any, toolName: string): string | undefined {
     if (command) return truncateStepText(command, 80);
   }
 
-  if (lower === "grep" || lower === "glob") {
+  if (lower === "grep" || lower === "glob" || lower === "search") {
     const root = pick("path");
     if (root) return `in ${normalizePathToken(root)}`;
   }
 
   if (lower === "task") {
-    const agent = pick("subagent_type");
+    const description = pick("description");
+    if (description) return truncateStepText(description, 80);
+    const agent = formatAgentLabel(pick("subagent_type"));
     if (agent) return `${agent} agent`;
   }
 
@@ -800,6 +852,44 @@ const ARTIFACT_PATH_PATTERN =
 const ARTIFACT_OUTPUT_SCAN_LIMIT = 4000;
 const ARTIFACT_OUTPUT_SKIP_TOOLS = new Set(["webfetch"]);
 
+// Patterns that indicate a path is a truncated system/absolute path rather than a workspace-relative path
+const TRUNCATED_SYSTEM_PATH_PATTERNS = [
+  /com\.[^/]+\.(openwork|opencode)/i, // macOS app bundle identifiers
+  /\.openwork\.dev\//i, // OpenWork dev paths
+  /Application Support\//i, // macOS Application Support
+  /AppData[/\\]/i, // Windows AppData
+  /\.local\/share\//i, // Linux XDG data
+  /workspaces\/[^/]+\/workspaces\//i, // Nested workspaces paths (clearly malformed)
+];
+
+/**
+ * Clean up an artifact path to extract the workspace-relative portion.
+ * Returns null if the path should be rejected entirely.
+ */
+function cleanArtifactPath(rawPath: string): string | null {
+  const normalized = rawPath.trim().replace(/[\\/]+/g, "/");
+  if (!normalized) return null;
+
+  // Check if this looks like a truncated system path
+  for (const pattern of TRUNCATED_SYSTEM_PATH_PATTERNS) {
+    if (pattern.test(normalized)) {
+      // Try to extract just the relative part after "workspaces/<name>/"
+      const workspacesMatch = normalized.match(/workspaces\/[^/]+\/(.+)$/i);
+      if (workspacesMatch && workspacesMatch[1]) {
+        const relative = workspacesMatch[1];
+        // Validate the extracted path doesn't still contain system patterns
+        if (!TRUNCATED_SYSTEM_PATH_PATTERNS.some((p) => p.test(relative))) {
+          return relative;
+        }
+      }
+      // Reject the path entirely if we can't extract a clean relative path
+      return null;
+    }
+  }
+
+  return normalized;
+}
+
 type DeriveArtifactsOptions = {
   maxMessages?: number;
 };
@@ -827,9 +917,34 @@ export function summarizeStep(part: Part): { title: string; detail?: string; isS
 
   if (part.type === "reasoning") {
     const record = part as any;
-    const text = typeof record.text === "string" ? record.text.trim() : "";
-    if (!text) return { title: "Planning", toolCategory: "tool" };
-    return { title: "Thinking", toolCategory: "tool" };
+    const text = typeof record.text === "string" ? cleanReasoningText(record.text) : "";
+    if (!text) return { title: "Thinking", toolCategory: "tool" };
+
+    const lines = text
+      .split(/\r?\n/)
+      .map((line: string) => line.trim())
+      .filter(Boolean);
+    const compact = lines.join(" ");
+
+    let headline = "";
+    let detail = "";
+    if (lines.length > 1) {
+      headline = lines[0];
+      detail = lines.slice(1).join("\n");
+    } else {
+      const sentenceBreak = compact.indexOf(". ");
+      if (sentenceBreak > 18 && sentenceBreak < 120) {
+        headline = compact.slice(0, sentenceBreak + 1).trim();
+        detail = compact.slice(sentenceBreak + 2).trim();
+      } else {
+        headline = compact;
+        detail = compact;
+      }
+    }
+
+    headline = headline.replace(/^thinking[:\s-]*/i, "").trim();
+    const title = `Thinking: ${truncateStepText(headline || "reviewing context", 96)}`;
+    return { title, detail: detail || undefined, toolCategory: "tool" };
   }
 
   if (part.type === "step-start" || part.type === "step-finish") {
@@ -906,19 +1021,19 @@ export function deriveArtifacts(list: MessageWithParts[], options: DeriveArtifac
       if (matches.size === 0) return;
 
       matches.forEach((match) => {
-        const normalizedPath = match.trim().replace(/[\\/]+/g, "/");
-        if (!normalizedPath) return;
+        const cleanedPath = cleanArtifactPath(match);
+        if (!cleanedPath) return;
 
-        const key = normalizedPath.toLowerCase();
-        const name = normalizedPath.split("/").pop() ?? normalizedPath;
-        const id = `artifact-${encodeURIComponent(normalizedPath)}`;
+        const key = cleanedPath.toLowerCase();
+        const name = cleanedPath.split("/").pop() ?? cleanedPath;
+        const id = `artifact-${encodeURIComponent(cleanedPath)}`;
 
         // Delete and re-add to move to end (most recent)
         if (results.has(key)) results.delete(key);
         results.set(key, {
           id,
           name,
-          path: normalizedPath,
+          path: cleanedPath,
           kind: "file" as const,
           size: state.size ? String(state.size) : undefined,
           messageId: messageId || undefined,

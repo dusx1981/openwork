@@ -851,6 +851,26 @@ export function createWorkspaceStore(options: {
             } catch {
               // ignore
             }
+          } else {
+            // In web mode, we still need to persist the resolved OpenWork connection
+            // details onto the workspace entry so that the sidebar can list sessions
+            // for multiple remotes at once (without relying on global server settings).
+            const resolvedToken = token.trim();
+            setWorkspaces((prev) =>
+              prev.map((ws) => {
+                if (ws.id !== next.id) return ws;
+                return {
+                  ...ws,
+                  remoteType: "openwork",
+                  baseUrl: resolvedBaseUrl.replace(/\/+$/, ""),
+                  directory: resolvedDirectory || null,
+                  openworkHostUrl: hostUrl,
+                  openworkToken: resolvedToken || null,
+                  openworkWorkspaceId: workspaceInfo?.id ?? ws.openworkWorkspaceId ?? null,
+                  openworkWorkspaceName: workspaceInfo?.name ?? ws.openworkWorkspaceName ?? null,
+                };
+              }),
+            );
           }
 
           syncActiveWorkspaceId(id);
@@ -2360,12 +2380,13 @@ export function createWorkspaceStore(options: {
       return false;
     }
 
-    if (activeWorkspaceInfo()?.workspaceType === "remote") {
+    const overrideWorkspacePath = optionsOverride?.workspacePath?.trim() ?? "";
+    if (activeWorkspaceInfo()?.workspaceType === "remote" && !overrideWorkspacePath) {
       options.setError(t("app.error.host_requires_local", currentLocale()));
       return false;
     }
 
-    const dir = (optionsOverride?.workspacePath ?? activeWorkspacePath() ?? projectDir()).trim();
+    const dir = (overrideWorkspacePath || activeWorkspacePath() || projectDir()).trim();
     if (!dir) {
       options.setError(t("app.error.pick_workspace_folder", currentLocale()));
       return false;

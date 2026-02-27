@@ -14,6 +14,7 @@ type Props = {
   workspaceRoot?: string;
   renderMarkdown?: boolean;
   markdownThrottleMs?: number;
+  highlightQuery?: string;
 };
 
 type LinkType = "url" | "file";
@@ -24,11 +25,35 @@ type TextSegment =
 
 const WEB_LINK_RE = /^(?:https?:\/\/|www\.)/i;
 const FILE_URI_RE = /^file:\/\//i;
+const URI_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const WINDOWS_PATH_RE = /^[A-Za-z]:[\\/][^\s"'`\)\]\}>]+$/;
 const POSIX_PATH_RE = /^\/(?!\/)[^\s"'`\)\]\}>][^\s"'`\)\]\}>]*$/;
 const TILDE_PATH_RE = /^~\/[^\s"'`\)\]\}>][^\s"'`\)\]\}>]*$/;
 const BARE_FILENAME_RE = /^(?!\.)(?!.*\.\.)(?:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)$/;
 const SAFE_PATH_CHAR_RE = /[^\s"'`\)\]\}>]/;
+
+const stripFileReferenceSuffix = (value: string) => {
+  const withoutQueryOrFragment = value.replace(/[?#].*$/, "").trim();
+  if (!withoutQueryOrFragment) return "";
+  return withoutQueryOrFragment.replace(/:(\d+)(?::\d+)?$/, "");
+};
+
+const isWorkspaceRelativeFilePath = (value: string) => {
+  const stripped = stripFileReferenceSuffix(value);
+  if (!stripped) return false;
+
+  const normalized = stripped.replace(/\\/g, "/");
+  if (!normalized.includes("/")) return false;
+  if (normalized.startsWith("/") || normalized.startsWith("~/") || normalized.startsWith("//")) {
+    return false;
+  }
+  if (URI_SCHEME_RE.test(normalized)) return false;
+  if (/^[A-Za-z]:\//.test(normalized)) return false;
+
+  const segments = normalized.split("/");
+  if (!segments.length) return false;
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+};
 
 const isRelativeFilePath = (value: string) => {
   if (value === "." || value === "..") return false;
@@ -77,6 +102,7 @@ const isLikelyFilePath = (value: string) => {
   if (TILDE_PATH_RE.test(value)) return true;
   if (isRelativeFilePath(value)) return true;
   if (isBareRelativeFilePath(value)) return true;
+  if (isWorkspaceRelativeFilePath(value)) return true;
 
   return false;
 };
@@ -199,6 +225,9 @@ const normalizeRelativePath = (relativePath: string, workspaceRoot: string) => {
 };
 
 const normalizeFilePath = (href: string, workspaceRoot: string): string | null => {
+  const strippedHref = stripFileReferenceSuffix(href);
+  if (!strippedHref) return null;
+
   if (FILE_URI_RE.test(href)) {
     try {
       const parsed = new URL(href);
@@ -219,8 +248,8 @@ const normalizeFilePath = (href: string, workspaceRoot: string): string | null =
     }
   }
 
-  const trimmed = href.trim();
-  if (isRelativeFilePath(trimmed) || isBareRelativeFilePath(trimmed)) {
+  const trimmed = strippedHref.trim();
+  if (isRelativeFilePath(trimmed) || isBareRelativeFilePath(trimmed) || isWorkspaceRelativeFilePath(trimmed)) {
     if (!workspaceRoot) return null;
     return normalizeRelativePath(trimmed, workspaceRoot);
   }
@@ -232,6 +261,75 @@ function clampText(text: string, max = 800) {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n\n… (truncated)`;
 }
+
+const SEARCH_HIGHLIGHT_MARK_ATTR = "data-search-highlight";
+
+const clearTextHighlights = (root: HTMLElement) => {
+  const marks = root.querySelectorAll(`mark[${SEARCH_HIGHLIGHT_MARK_ATTR}="true"]`);
+  marks.forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    parent.replaceChild(document.createTextNode(mark.textContent ?? ""), mark);
+  });
+  root.normalize();
+};
+
+const applyTextHighlights = (root: HTMLElement, query: string) => {
+  clearTextHighlights(root);
+  const needle = query.trim().toLowerCase();
+  if (!needle) return;
+
+  const walker = document.createTreeWalker(
+    root,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        const value = node.nodeValue ?? "";
+        if (!value.trim()) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        if (parent.closest("pre, code")) return NodeFilter.FILTER_REJECT;
+        if (parent.tagName === "SCRIPT" || parent.tagName === "STYLE") return NodeFilter.FILTER_REJECT;
+        return value.toLowerCase().includes(needle) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    },
+  );
+
+  const nodes: Text[] = [];
+  let current = walker.nextNode();
+  while (current) {
+    nodes.push(current as Text);
+    current = walker.nextNode();
+  }
+
+  nodes.forEach((node) => {
+    const text = node.nodeValue ?? "";
+    const lower = text.toLowerCase();
+    let searchIndex = 0;
+    const fragment = document.createDocumentFragment();
+
+    while (searchIndex < text.length) {
+      const matchIndex = lower.indexOf(needle, searchIndex);
+      if (matchIndex === -1) {
+        fragment.appendChild(document.createTextNode(text.slice(searchIndex)));
+        break;
+      }
+
+      if (matchIndex > searchIndex) {
+        fragment.appendChild(document.createTextNode(text.slice(searchIndex, matchIndex)));
+      }
+
+      const mark = document.createElement("mark");
+      mark.setAttribute(SEARCH_HIGHLIGHT_MARK_ATTR, "true");
+      mark.className = "rounded px-0.5 bg-amber-4/70 text-current";
+      mark.textContent = text.slice(matchIndex, matchIndex + needle.length);
+      fragment.appendChild(mark);
+      searchIndex = matchIndex + needle.length;
+    }
+
+    node.parentNode?.replaceChild(fragment, node);
+  });
+};
 
 function useThrottledValue<T>(value: () => T, delayMs: number | (() => number) = 80) {
   const [state, setState] = createSignal<T>(value());
@@ -256,6 +354,43 @@ function useThrottledValue<T>(value: () => T, delayMs: number | (() => number) =
   });
 
   return state;
+}
+
+const MARKDOWN_CACHE_MAX_ENTRIES = 100;
+const markdownHtmlCache = new Map<string, string>();
+const rendererByTone = new Map<"light" | "dark", ReturnType<typeof createCustomRenderer>>();
+
+function markdownCacheKey(tone: "light" | "dark", text: string) {
+  return `${tone}\u0000${text}`;
+}
+
+function readMarkdownCache(key: string) {
+  const cached = markdownHtmlCache.get(key);
+  if (cached === undefined) return;
+  markdownHtmlCache.delete(key);
+  markdownHtmlCache.set(key, cached);
+  return cached;
+}
+
+function writeMarkdownCache(key: string, html: string) {
+  if (markdownHtmlCache.has(key)) {
+    markdownHtmlCache.delete(key);
+  }
+  markdownHtmlCache.set(key, html);
+
+  while (markdownHtmlCache.size > MARKDOWN_CACHE_MAX_ENTRIES) {
+    const oldest = markdownHtmlCache.keys().next().value;
+    if (!oldest) break;
+    markdownHtmlCache.delete(oldest);
+  }
+}
+
+function rendererForTone(tone: "light" | "dark") {
+  const cached = rendererByTone.get(tone);
+  if (cached) return cached;
+  const next = createCustomRenderer(tone);
+  rendererByTone.set(tone, next);
+  return next;
 }
 
 function createCustomRenderer(tone: "light" | "dark") {
@@ -344,6 +479,7 @@ export default function PartView(props: Props) {
   const showThinking = () => props.showThinking ?? true;
   const renderMarkdown = () => props.renderMarkdown ?? false;
   const markdownThrottleMs = () => Math.max(0, props.markdownThrottleMs ?? 100);
+  let textContainerEl: HTMLDivElement | undefined;
   const fileInfo = () => {
     if (p().type !== "file") return null;
     const part = p() as {
@@ -397,10 +533,15 @@ export default function PartView(props: Props) {
     if (!renderMarkdown() || p().type !== "text") return null;
     const text = throttledMarkdownSource();
     if (!text.trim()) return "";
+
+    const toneKey = tone();
+    const cacheKey = markdownCacheKey(toneKey, text);
+    const cachedHtml = readMarkdownCache(cacheKey);
+    if (cachedHtml !== undefined) return cachedHtml;
     
     try {
       const startedAt = perfNow();
-      const renderer = createCustomRenderer(tone());
+      const renderer = rendererForTone(toneKey);
       const result = marked.parse(text, { 
         breaks: true, 
         gfm: true,
@@ -417,8 +558,10 @@ export default function PartView(props: Props) {
           ms: parseMs,
         });
       }
-      
-      return typeof result === 'string' ? result : '';
+
+      const html = typeof result === "string" ? result : "";
+      writeMarkdownCache(cacheKey, html);
+      return html;
     } catch (error) {
       console.error('Markdown parsing error:', error);
       return null;
@@ -494,6 +637,19 @@ export default function PartView(props: Props) {
       </span>
     );
   };
+
+  createEffect(() => {
+    if (p().type !== "text") return;
+    const root = textContainerEl;
+    if (!root) return;
+    const query = props.highlightQuery ?? "";
+    const markdownSnapshot = renderMarkdown() ? renderedMarkdown() : null;
+    queueMicrotask(() => {
+      if (!textContainerEl || textContainerEl !== root) return;
+      applyTextHighlights(textContainerEl, query);
+    });
+    void markdownSnapshot;
+  });
 
   const toolData = () => {
     if (p().type !== "tool") return null;
@@ -656,7 +812,12 @@ export default function PartView(props: Props) {
         <Show
           when={renderMarkdown()}
           fallback={
-            <div class={`whitespace-pre-wrap break-words ${textClass()}`.trim()}>
+            <div
+              ref={(el) => {
+                textContainerEl = el;
+              }}
+              class={`whitespace-pre-wrap break-words ${textClass()}`.trim()}
+            >
               {renderTextWithLinks()}
             </div>
           }
@@ -664,12 +825,20 @@ export default function PartView(props: Props) {
           <Show
             when={renderedMarkdown()}
             fallback={
-              <div class={`whitespace-pre-wrap break-words ${textClass()}`.trim()}>
+              <div
+                ref={(el) => {
+                  textContainerEl = el;
+                }}
+                class={`whitespace-pre-wrap break-words ${textClass()}`.trim()}
+              >
                 {renderTextWithLinks()}
               </div>
             }
           >
             <div
+              ref={(el) => {
+                textContainerEl = el;
+              }}
               class={`markdown-content max-w-none ${textClass()}
                 [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:my-4
                 [&_h2]:text-xl [&_h2]:font-bold [&_h2]:my-3
