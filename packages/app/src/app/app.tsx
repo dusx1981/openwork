@@ -4881,28 +4881,30 @@ export default function App() {
         checkForUpdates({ quiet: true }).catch(() => undefined);
       }
 
-      try {
-        const { getCurrent, onOpenUrl } = await import("@tauri-apps/plugin-deep-link");
-        const consumeUrls = (urls: string[] | null | undefined) => {
-          if (!Array.isArray(urls)) {
-            return;
-          }
-          for (const url of urls) {
-            if (queueRemoteConnectDeepLink(url) || queueSharedBundleDeepLink(url)) {
-              break;
+      if (isTauriRuntime()) {
+        try {
+          const { getCurrent, onOpenUrl } = await import("@tauri-apps/plugin-deep-link");
+          const consumeUrls = (urls: string[] | null | undefined) => {
+            if (!Array.isArray(urls)) {
+              return;
             }
-          }
-        };
+            for (const url of urls) {
+              if (queueRemoteConnectDeepLink(url) || queueSharedBundleDeepLink(url)) {
+                break;
+              }
+            }
+          };
 
-        consumeUrls(await getCurrent());
-        const unlisten = await onOpenUrl((urls) => {
-          consumeUrls(urls);
-        });
-        onCleanup(() => {
-          unlisten();
-        });
-      } catch {
-        // ignore
+          consumeUrls(await getCurrent());
+          const unlisten = await onOpenUrl((urls) => {
+            consumeUrls(urls);
+          });
+          onCleanup(() => {
+            unlisten();
+          });
+        } catch {
+          // ignore
+        }
       }
     }
 
